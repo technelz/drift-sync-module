@@ -1,0 +1,12 @@
+dr_orchestrator/
+├── sync_sgs.py
+├── sync_target_groups.py
+├── sync_albs.py
+├── dr_orchestrator.py
+├── dr_config.json
+├── reports/
+│   ├── sg_sync_report.json
+│   ├── tg_sync_report.json
+│   ├── alb_sync_report.json
+│   └── dr_orchestrator_report.json
+└── runbooks/

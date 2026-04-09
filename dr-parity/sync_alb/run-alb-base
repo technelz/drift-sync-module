@@ -1,0 +1,7 @@
+& ./.venv/bin/python3 ./sync_alb_listeners2.py `
+  --source-profile prod-profile `
+  --source-region us-east-1 `
+  --source-alb-name alb-01 `
+  --target-profile dr-profile `
+  --target-region us-east-2 `
+  --target-alb-name alb-01-dr

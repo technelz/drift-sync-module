@@ -1,0 +1,34 @@
+{
+  "global": {
+    "source_profile": "prod-profile",
+    "source_region": "us-east-1",
+    "target_profile": "dr-profile",
+    "target_region": "us-east-2",
+    "fail_fast": true,
+    "wait_timeout_seconds": 300,
+    "wait_interval_seconds": 10
+  },
+  "network": {
+    "source_vpc_id": "vpc-07e9b545595333c38",
+    "target_vpc_id": "vpc-081d7ae01e6d85d22"
+  },
+  "phases": {
+    "sgs": {
+      "enabled": true,
+      "script_path": "./sync_sgs.py"
+    },
+    "target_groups": {
+      "enabled": true,
+      "script_path": "./sync_target_groups.py"
+    },
+    "albs": {
+      "enabled": true,
+      "script_path": "./sync_albs.py",
+      "alb_map_file": "./alb_map.json"
+    }
+  },
+  "reports": {
+    "output_dir": "./reports",
+    "orchestrator_report_file": "dr_orchestrator_report.json"
+  }
+}

@@ -1,0 +1,4 @@
+aws elbv2 describe-target-groups \
+  --profile prod-profile \
+  --region us-east-1 \
+  --output json > tg-export.json

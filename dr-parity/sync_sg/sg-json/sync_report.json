@@ -1,0 +1,129 @@
+[
+  {
+    "group_name": "onemore-sg",
+    "source_group_id": "sg-0b2cbd95988a73bec",
+    "target_group_id": "sg-0883de4947ac42733",
+    "exists_in_target": true,
+    "description_match": true,
+    "tags_match": true,
+    "ingress_match": true,
+    "egress_match": true,
+    "skipped_ingress_count": 0,
+    "skipped_egress_count": 0,
+    "missing_ingress_rules": [],
+    "extra_ingress_rules": [],
+    "missing_egress_rules": [],
+    "extra_egress_rules": [],
+    "notes": [],
+    "in_sync": true
+  },
+  {
+    "group_name": "launch-wizard-1",
+    "source_group_id": "sg-0f245b5a756d5f0da",
+    "target_group_id": "sg-00c63ffb3207bcc57",
+    "exists_in_target": true,
+    "description_match": true,
+    "tags_match": true,
+    "ingress_match": true,
+    "egress_match": true,
+    "skipped_ingress_count": 0,
+    "skipped_egress_count": 0,
+    "missing_ingress_rules": [],
+    "extra_ingress_rules": [],
+    "missing_egress_rules": [],
+    "extra_egress_rules": [],
+    "notes": [],
+    "in_sync": true
+  },
+  {
+    "group_name": "demo",
+    "source_group_id": "sg-05bc263e7e46d607e",
+    "target_group_id": "sg-09be78dfff76e4464",
+    "exists_in_target": true,
+    "description_match": true,
+    "tags_match": true,
+    "ingress_match": false,
+    "egress_match": false,
+    "skipped_ingress_count": 0,
+    "skipped_egress_count": 0,
+    "missing_ingress_rules": [
+      {
+        "FromPort": 445,
+        "IpProtocol": "tcp",
+        "ToPort": 445,
+        "UserIdGroupPairs": [
+          {
+            "Description": "smb",
+            "GroupId": "sg-04607da4bde5c2700",
+            "UserId": "855956050827"
+          }
+        ]
+      },
+      {
+        "FromPort": 53,
+        "IpProtocol": "udp",
+        "PrefixListIds": [
+          {
+            "Description": "udp",
+            "PrefixListId": "pl-079a97b94f32e4ee7"
+          }
+        ],
+        "ToPort": 53
+      }
+    ],
+    "extra_ingress_rules": [],
+    "missing_egress_rules": [
+      {
+        "IpProtocol": "-1",
+        "UserIdGroupPairs": [
+          {
+            "GroupId": "sg-04607da4bde5c2700",
+            "UserId": "855956050827"
+          }
+        ]
+      }
+    ],
+    "extra_egress_rules": [],
+    "notes": [
+      "2 missing ingress rule(s) in target.",
+      "1 missing egress rule(s) in target."
+    ],
+    "in_sync": false
+  },
+  {
+    "group_name": "trythis",
+    "source_group_id": "sg-0aa393328052f3831",
+    "target_group_id": "sg-04e1f301c04bcbe8e",
+    "exists_in_target": true,
+    "description_match": true,
+    "tags_match": true,
+    "ingress_match": true,
+    "egress_match": true,
+    "skipped_ingress_count": 0,
+    "skipped_egress_count": 0,
+    "missing_ingress_rules": [],
+    "extra_ingress_rules": [],
+    "missing_egress_rules": [],
+    "extra_egress_rules": [],
+    "notes": [],
+    "in_sync": true
+  },
+  {
+    "group_name": "web-sg",
+    "source_group_id": "sg-0f56411dd012b6375",
+    "target_group_id": "sg-04607da4bde5c2700",
+    "exists_in_target": true,
+    "description_match": true,
+    "tags_match": true,
+    "ingress_match": true,
+    "egress_match": true,
+    "skipped_ingress_count": 0,
+    "skipped_egress_count": 0,
+    "missing_ingress_rules": [],
+    "extra_ingress_rules": [],
+    "missing_egress_rules": [],
+    "extra_egress_rules": [],
+    "notes": [],
+    "in_sync": true
+  }
+]
