@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+Sync AWS Security Groups from source to target.
+
+Supports either:
+1) Live source pull from AWS using source profile/region/vpc
+2) Existing JSON file from `aws ec2 describe-security-groups`
+
+Examples:
+
+python3 sync_sgs.py \
+  --json-path ./sg-export.json \
+  --target-profile dr-profile \
+  --target-region us-east-2 \
+  --target-vpc-id vpc-081d7ae01e6d85d22 \
+  --dry-run
+
+python3 sync_sgs.py \
+  --source-profile prod-profile \
+  --source-region us-east-1 \
+  --source-vpc-id vpc-07e9b545595333c38 \
+  --target-profile dr-profile \
+  --target-region us-east-2 \
+  --target-vpc-id vpc-081d7ae01e6d85d22
+
+Friendly alias mode:
+
+python3 sync_sgs.py \
+  --prod-profile prod-profile \
+  --prod-region us-east-1 \
+  --prod-vpc-id vpc-07e9b545595333c38 \
+  --dr-profile dr-profile \
+  --dr-region us-east-2 \
+  --dr-vpc-id vpc-081d7ae01e6d85d22
+
+Requires:
+  pip install boto3
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+from botocore.exceptions import ClientError
+
+
+# ---------------------------------------------------------
+# logging
+# ---------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------
+# aws helpers
+# ---------------------------------------------------------
+
+def boto3_session(profile: str, region: str):
+    return boto3.Session(profile_name=profile, region_name=region)
+
+
+def get_ec2(profile: str, region: str):
+    return boto3_session(profile, region).client("ec2")
+
+
+# ---------------------------------------------------------
+# models
+# ---------------------------------------------------------
+
+@dataclass
+class Args:
+    json_path: Optional[str]
+
+    source_profile: Optional[str]
+    source_region: Optional[str]
+    source_vpc_id: Optional[str]
+
+    target_profile: str
+    target_region: str
+    target_vpc_id: str
+
+    dry_run: bool
+    report_only: bool
+    yes: bool
+
+
+@dataclass
+class SgAuditResult:
+    group_name: str
+    source_group_id: Optional[str] = None
+    target_group_id: Optional[str] = None
+    exists_in_target: bool = False
+    description_match: bool = True
+    tags_match: bool = True
+    ingress_match: bool = True
+    egress_match: bool = True
+    missing: List[str] = field(default_factory=list)
+    drift_fields: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def in_sync(self) -> bool:
+        return (
+            self.exists_in_target
+            and self.description_match
+            and self.tags_match
+            and self.ingress_match
+            and self.egress_match
+        )
+
+
+# ---------------------------------------------------------
+# parsing / normalization helpers
+# ---------------------------------------------------------
+
+SYSTEM_TAG_KEYS_TO_IGNORE = {
+    # extend if needed
+}
+
+
+def normalize_args(ns: argparse.Namespace) -> Args:
+    source_profile = ns.source_profile or ns.prod_profile
+    source_region = ns.source_region or ns.prod_region
+    source_vpc_id = ns.source_vpc_id or ns.prod_vpc_id
+
+    target_profile = ns.target_profile or ns.dr_profile
+    target_region = ns.target_region or ns.dr_region
+    target_vpc_id = ns.target_vpc_id or ns.dr_vpc_id
+
+    if not target_profile or not target_region or not target_vpc_id:
+        raise SystemExit(
+            "Target/DR values are required. Provide either "
+            "--target-profile/--target-region/--target-vpc-id or "
+            "--dr-profile/--dr-region/--dr-vpc-id."
+        )
+
+    if not ns.json_path:
+        missing = []
+        if not source_profile:
+            missing.append("source/prod profile")
+        if not source_region:
+            missing.append("source/prod region")
+        if not source_vpc_id:
+            missing.append("source/prod vpc id")
+        if missing:
+            raise SystemExit(
+                "Either --json-path must be provided, or all source/prod values must be set. "
+                f"Missing: {', '.join(missing)}"
+            )
+
+    return Args(
+        json_path=ns.json_path,
+        source_profile=source_profile,
+        source_region=source_region,
+        source_vpc_id=source_vpc_id,
+        target_profile=target_profile,
+        target_region=target_region,
+        target_vpc_id=target_vpc_id,
+        dry_run=ns.dry_run,
+        report_only=ns.report_only,
+        yes=ns.yes,
+    )
+
+
+def canonical_tags(tags: Optional[List[Dict[str, str]]]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    for t in tags or []:
+        key = t.get("Key", "")
+        val = t.get("Value", "")
+        if key and key not in SYSTEM_TAG_KEYS_TO_IGNORE:
+            out.append((key, val))
+    return sorted(out)
+
+
+def tags_to_aws_payload(tags: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+    return [{"Key": k, "Value": v} for k, v in tags]
+
+
+def is_default_sg(sg: Dict[str, Any]) -> bool:
+    return sg.get("GroupName") == "default"
+
+
+# ---------------------------------------------------------
+# source loading
+# ---------------------------------------------------------
+
+def load_json_security_groups(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and "SecurityGroups" in data:
+        groups = data["SecurityGroups"]
+    elif isinstance(data, list):
+        groups = data
+    else:
+        raise ValueError("Unsupported SG JSON format. Expected either {'SecurityGroups': [...]} or [...]")
+
+    if not isinstance(groups, list):
+        raise ValueError("Security groups payload is not a list")
+
+    return groups
+
+
+def describe_security_groups_by_vpc(ec2, vpc_id: str) -> List[Dict[str, Any]]:
+    paginator = ec2.get_paginator("describe_security_groups")
+    out: List[Dict[str, Any]] = []
+    for page in paginator.paginate(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]):
+        out.extend(page.get("SecurityGroups", []))
+    return out
+
+
+def fetch_source_security_groups(args: Args) -> List[Dict[str, Any]]:
+    if args.json_path:
+        log(f"[INFO] Loading source security groups from JSON: {args.json_path}")
+        return load_json_security_groups(args.json_path)
+
+    assert args.source_profile and args.source_region and args.source_vpc_id
+    log(
+        f"[INFO] Pulling source security groups from AWS "
+        f"(profile={args.source_profile}, region={args.source_region}, vpc={args.source_vpc_id})"
+    )
+    ec2 = get_ec2(args.source_profile, args.source_region)
+    return describe_security_groups_by_vpc(ec2, args.source_vpc_id)
+
+
+# ---------------------------------------------------------
+# target inventory
+# ---------------------------------------------------------
+
+def get_target_sg_map(ec2, vpc_id: str) -> Dict[str, Dict[str, Any]]:
+    groups = describe_security_groups_by_vpc(ec2, vpc_id)
+    return {sg["GroupName"]: sg for sg in groups}
+
+
+# ---------------------------------------------------------
+# safety guard
+# ---------------------------------------------------------
+
+def print_execution_context(args: Args) -> None:
+    print("\n" + "=" * 72)
+    print("EXECUTION CONTEXT")
+    print("=" * 72)
+    if args.json_path:
+        print(f"SOURCE MODE : JSON export")
+        print(f"SOURCE FILE : {args.json_path}")
+    else:
+        print(f"FROM (PROD) : profile={args.source_profile} region={args.source_region} vpc={args.source_vpc_id}")
+    print(f"TO   (DR)   : profile={args.target_profile} region={args.target_region} vpc={args.target_vpc_id}")
+    print(f"MODE        : {'DRY-RUN' if args.dry_run else 'REPORT-ONLY' if args.report_only else 'APPLY'}")
+    print("=" * 72 + "\n")
+
+
+def require_confirmation(args: Args) -> None:
+    if args.dry_run or args.report_only or args.yes:
+        return
+
+    answer = input("Proceed with SECURITY GROUP sync from PROD/source to DR/target? Type 'yes' to continue: ").strip()
+    if answer.lower() != "yes":
+        raise SystemExit("Aborted by user.")
+
+
+# ---------------------------------------------------------
+# permission normalization
+# ---------------------------------------------------------
+
+def map_user_group_pairs(
+    user_group_pairs: List[Dict[str, Any]],
+    source_group_id_to_name: Dict[str, str],
+    target_group_name_to_id: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    mapped: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+
+    for pair in user_group_pairs or []:
+        src_group_id = pair.get("GroupId")
+        if not src_group_id:
+            unresolved.append("Encountered UserIdGroupPair without GroupId")
+            continue
+
+        sg_name = source_group_id_to_name.get(src_group_id)
+        if not sg_name:
+            unresolved.append(f"Missing source SG name for GroupId {src_group_id}")
+            continue
+
+        tgt_group_id = target_group_name_to_id.get(sg_name)
+        if not tgt_group_id:
+            unresolved.append(f"Missing target SG for source SG name {sg_name}")
+            continue
+
+        new_pair = {"GroupId": tgt_group_id}
+        if pair.get("Description") is not None:
+            new_pair["Description"] = pair["Description"]
+        mapped.append(new_pair)
+
+    mapped = sorted(mapped, key=lambda x: x["GroupId"])
+    return mapped, unresolved
+
+
+def normalize_permission(
+    perm: Dict[str, Any],
+    source_group_id_to_name: Dict[str, str],
+    target_group_name_to_id: Dict[str, str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    unresolved: List[str] = []
+
+    norm: Dict[str, Any] = {
+        "IpProtocol": perm.get("IpProtocol"),
+    }
+
+    if perm.get("FromPort") is not None:
+        norm["FromPort"] = perm["FromPort"]
+    if perm.get("ToPort") is not None:
+        norm["ToPort"] = perm["ToPort"]
+
+    ip_ranges = [
+        {"CidrIp": r["CidrIp"], **({"Description": r["Description"]} if r.get("Description") is not None else {})}
+        for r in perm.get("IpRanges", [])
+        if r.get("CidrIp")
+    ]
+    ipv6_ranges = [
+        {"CidrIpv6": r["CidrIpv6"], **({"Description": r["Description"]} if r.get("Description") is not None else {})}
+        for r in perm.get("Ipv6Ranges", [])
+        if r.get("CidrIpv6")
+    ]
+    prefix_list_ids = [
+        {"PrefixListId": r["PrefixListId"], **({"Description": r["Description"]} if r.get("Description") is not None else {})}
+        for r in perm.get("PrefixListIds", [])
+        if r.get("PrefixListId")
+    ]
+
+    mapped_groups, group_unresolved = map_user_group_pairs(
+        perm.get("UserIdGroupPairs", []),
+        source_group_id_to_name,
+        target_group_name_to_id,
+    )
+    unresolved.extend(group_unresolved)
+
+    if ip_ranges:
+        norm["IpRanges"] = sorted(ip_ranges, key=lambda x: (x["CidrIp"], x.get("Description", "")))
+    if ipv6_ranges:
+        norm["Ipv6Ranges"] = sorted(ipv6_ranges, key=lambda x: (x["CidrIpv6"], x.get("Description", "")))
+    if prefix_list_ids:
+        norm["PrefixListIds"] = sorted(prefix_list_ids, key=lambda x: (x["PrefixListId"], x.get("Description", "")))
+    if mapped_groups:
+        norm["UserIdGroupPairs"] = mapped_groups
+
+    return norm, unresolved
+
+
+def normalize_permissions(
+    perms: List[Dict[str, Any]],
+    source_group_id_to_name: Dict[str, str],
+    target_group_name_to_id: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    normalized: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+
+    for perm in perms or []:
+        norm, unr = normalize_permission(perm, source_group_id_to_name, target_group_name_to_id)
+        unresolved.extend(unr)
+        normalized.append(norm)
+
+    normalized = sorted(normalized, key=lambda x: json.dumps(x, sort_keys=True))
+    return normalized, unresolved
+
+
+# ---------------------------------------------------------
+# create / update helpers
+# ---------------------------------------------------------
+
+def create_or_get_security_group(ec2, source_sg: Dict[str, Any], target_vpc_id: str, dry_run: bool) -> str:
+    name = source_sg["GroupName"]
+
+    existing = ec2.describe_security_groups(
+        Filters=[
+            {"Name": "vpc-id", "Values": [target_vpc_id]},
+            {"Name": "group-name", "Values": [name]},
+        ]
+    ).get("SecurityGroups", [])
+
+    if existing:
+        return existing[0]["GroupId"]
+
+    if dry_run:
+        log(f"[DRY-RUN] Would create security group: {name}")
+        return f"dryrun:{name}"
+
+    resp = ec2.create_security_group(
+        GroupName=name,
+        Description=source_sg.get("Description", name),
+        VpcId=target_vpc_id,
+    )
+    sg_id = resp["GroupId"]
+    log(f"[CREATE] Security group {name} -> {sg_id}")
+    return sg_id
+
+
+def sync_tags(ec2, target_group_id: str, desired_tags: List[Tuple[str, str]], current_tags: List[Tuple[str, str]], dry_run: bool) -> None:
+    desired_payload = tags_to_aws_payload(desired_tags)
+    current_keys = {k for k, _ in current_tags}
+    desired_keys = {k for k, _ in desired_tags}
+
+    to_remove = sorted(current_keys - desired_keys)
+    if desired_tags != current_tags:
+        log(f"[SYNC] Tags differ for {target_group_id}")
+
+    if dry_run:
+        if desired_tags != current_tags:
+            log(f"[DRY-RUN] Current tags: {current_tags}")
+            log(f"[DRY-RUN] Desired tags: {desired_tags}")
+        return
+
+    if desired_payload:
+        ec2.create_tags(Resources=[target_group_id], Tags=desired_payload)
+
+    if to_remove:
+        ec2.delete_tags(
+            Resources=[target_group_id],
+            Tags=[{"Key": k} for k in to_remove],
+        )
+
+
+def revoke_all_ingress(ec2, group_id: str, current: List[Dict[str, Any]], dry_run: bool) -> None:
+    if not current:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would revoke all ingress on {group_id}")
+        return
+    ec2.revoke_security_group_ingress(GroupId=group_id, IpPermissions=current)
+
+
+def revoke_all_egress(ec2, group_id: str, current: List[Dict[str, Any]], dry_run: bool) -> None:
+    if not current:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would revoke all egress on {group_id}")
+        return
+    ec2.revoke_security_group_egress(GroupId=group_id, IpPermissions=current)
+
+
+def authorize_ingress(ec2, group_id: str, desired: List[Dict[str, Any]], dry_run: bool) -> None:
+    if not desired:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would authorize ingress on {group_id}: {json.dumps(desired)}")
+        return
+    ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=desired)
+
+
+def authorize_egress(ec2, group_id: str, desired: List[Dict[str, Any]], dry_run: bool) -> None:
+    if not desired:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would authorize egress on {group_id}: {json.dumps(desired)}")
+        return
+    ec2.authorize_security_group_egress(GroupId=group_id, IpPermissions=desired)
+
+
+# ---------------------------------------------------------
+# audit
+# ---------------------------------------------------------
+
+def audit_security_group(
+    source_sg: Dict[str, Any],
+    source_desc: str,
+    source_tags: List[Tuple[str, str]],
+    source_ingress: List[Dict[str, Any]],
+    source_egress: List[Dict[str, Any]],
+    target_sg: Optional[Dict[str, Any]],
+    target_desc: Optional[str],
+    target_tags: Optional[List[Tuple[str, str]]],
+    target_ingress: Optional[List[Dict[str, Any]]],
+    target_egress: Optional[List[Dict[str, Any]]],
+) -> SgAuditResult:
+    result = SgAuditResult(
+        group_name=source_sg["GroupName"],
+        source_group_id=source_sg.get("GroupId"),
+    )
+
+    if not target_sg:
+        result.exists_in_target = False
+        result.missing.append("Security group missing in target environment.")
+        return result
+
+    result.exists_in_target = True
+    result.target_group_id = target_sg.get("GroupId")
+
+    if source_desc != (target_desc or ""):
+        result.description_match = False
+        result.drift_fields.append("Description")
+
+    if source_tags != (target_tags or []):
+        result.tags_match = False
+        result.drift_fields.append("Tags")
+
+    if source_ingress != (target_ingress or []):
+        result.ingress_match = False
+        result.drift_fields.append("Ingress")
+
+    if source_egress != (target_egress or []):
+        result.egress_match = False
+        result.drift_fields.append("Egress")
+
+    return result
+
+
+def print_audit_report(results: List[SgAuditResult]) -> None:
+    print("\n" + "=" * 80)
+    print("FINAL SECURITY GROUP SYNC AUDIT REPORT")
+    print("=" * 80)
+
+    in_sync = [r for r in results if r.in_sync]
+    out_of_sync = [r for r in results if not r.in_sync]
+
+    print(f"Total SGs audited : {len(results)}")
+    print(f"In sync           : {len(in_sync)}")
+    print(f"Needs review      : {len(out_of_sync)}")
+    print("")
+
+    if not out_of_sync:
+        print("All audited security groups are in sync.")
+        print("=" * 80)
+        return
+
+    for r in out_of_sync:
+        print("-" * 80)
+        print(f"SG: {r.group_name}")
+        print(f"Source SG ID : {r.source_group_id}")
+        print(f"Target SG ID : {r.target_group_id}")
+        print(f"Exists       : {r.exists_in_target}")
+        print(f"Description  : {'OK' if r.description_match else 'MISMATCH'}")
+        print(f"Tags         : {'OK' if r.tags_match else 'MISMATCH'}")
+        print(f"Ingress      : {'OK' if r.ingress_match else 'MISMATCH'}")
+        print(f"Egress       : {'OK' if r.egress_match else 'MISMATCH'}")
+
+        if r.missing:
+            print("Missing:")
+            for item in r.missing:
+                print(f"  - {item}")
+
+        if r.drift_fields:
+            print("Drift fields:")
+            for f in sorted(set(r.drift_fields)):
+                print(f"  - {f}")
+
+        if r.notes:
+            print("Notes:")
+            for n in r.notes:
+                print(f"  - {n}")
+
+    print("=" * 80)
+
+
+def write_audit_report_json(results: List[SgAuditResult], path: str = "sg_sync_report.json") -> None:
+    payload = []
+    for r in results:
+        payload.append({
+            "group_name": r.group_name,
+            "source_group_id": r.source_group_id,
+            "target_group_id": r.target_group_id,
+            "exists_in_target": r.exists_in_target,
+            "description_match": r.description_match,
+            "tags_match": r.tags_match,
+            "ingress_match": r.ingress_match,
+            "egress_match": r.egress_match,
+            "missing": r.missing,
+            "drift_fields": r.drift_fields,
+            "notes": r.notes,
+            "in_sync": r.in_sync,
+        })
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    log(f"[INFO] Wrote audit report to {path}")
+
+
+# ---------------------------------------------------------
+# args
+# ---------------------------------------------------------
+
+def parse_args() -> Args:
+    p = argparse.ArgumentParser(description="Sync AWS Security Groups from source to target")
+
+    source = p.add_argument_group("source")
+    source.add_argument("--json-path", help="Existing JSON export from describe-security-groups")
+    source.add_argument("--source-profile", help="Source AWS CLI profile")
+    source.add_argument("--source-region", help="Source AWS region")
+    source.add_argument("--source-vpc-id", help="Source VPC ID")
+
+    prod = p.add_argument_group("friendly prod aliases")
+    prod.add_argument("--prod-profile", help="Alias of --source-profile")
+    prod.add_argument("--prod-region", help="Alias of --source-region")
+    prod.add_argument("--prod-vpc-id", help="Alias of --source-vpc-id")
+
+    target = p.add_argument_group("target")
+    target.add_argument("--target-profile", help="Target AWS CLI profile")
+    target.add_argument("--target-region", help="Target AWS region")
+    target.add_argument("--target-vpc-id", help="Target VPC ID")
+
+    dr = p.add_argument_group("friendly dr aliases")
+    dr.add_argument("--dr-profile", help="Alias of --target-profile")
+    dr.add_argument("--dr-region", help="Alias of --target-region")
+    dr.add_argument("--dr-vpc-id", help="Alias of --target-vpc-id")
+
+    p.add_argument("--dry-run", action="store_true", help="Show changes without applying them")
+    p.add_argument("--report-only", action="store_true", help="Only audit, do not create or modify")
+    p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for real apply")
+
+    return normalize_args(p.parse_args())
+
+
+# ---------------------------------------------------------
+# main
+# ---------------------------------------------------------
+
+def main() -> int:
+    args = parse_args()
+    print_execution_context(args)
+    require_confirmation(args)
+
+    source_groups = fetch_source_security_groups(args)
+    if not source_groups:
+        log("[INFO] No security groups found in source scope.")
+        return 0
+
+    # Usually do not clone default SG
+    source_groups = [sg for sg in source_groups if not is_default_sg(sg)]
+
+    if not source_groups:
+        log("[INFO] No non-default security groups found in source scope.")
+        return 0
+
+    target_ec2 = get_ec2(args.target_profile, args.target_region)
+
+    log(f"[INFO] Target profile={args.target_profile} region={args.target_region} vpc={args.target_vpc_id}")
+    log(f"[INFO] Source security groups to process: {len(source_groups)}")
+
+    # source lookup by id->name
+    source_group_id_to_name = {sg.get("GroupId"): sg.get("GroupName") for sg in source_groups if sg.get("GroupId")}
+
+    # target inventory
+    target_by_name = get_target_sg_map(target_ec2, args.target_vpc_id)
+
+    # phase 1: create missing groups
+    if not args.report_only:
+        for source_sg in source_groups:
+            name = source_sg["GroupName"]
+            if name not in target_by_name:
+                try:
+                    create_or_get_security_group(
+                        target_ec2,
+                        source_sg,
+                        args.target_vpc_id,
+                        args.dry_run,
+                    )
+                except ClientError as e:
+                    eprint(f"[ERROR] Failed to create/get security group {name}: {e}")
+                    return 2
+
+        # refresh after creation
+        target_by_name = get_target_sg_map(target_ec2, args.target_vpc_id)
+
+        # phase 2: sync tags + rules
+        target_group_name_to_id = {
+            sg["GroupName"]: sg["GroupId"]
+            for sg in target_by_name.values()
+            if sg.get("GroupId")
+        }
+
+        for source_sg in source_groups:
+            name = source_sg["GroupName"]
+            target_sg = target_by_name.get(name)
+            if not target_sg:
+                eprint(f"[ERROR] Target SG missing after creation phase: {name}")
+                continue
+
+            source_tags = canonical_tags(source_sg.get("Tags"))
+            target_tags = canonical_tags(target_sg.get("Tags"))
+
+            if source_tags != target_tags:
+                sync_tags(
+                    target_ec2,
+                    target_sg["GroupId"],
+                    source_tags,
+                    target_tags,
+                    args.dry_run,
+                )
+
+            desired_ingress, ingress_unresolved = normalize_permissions(
+                source_sg.get("IpPermissions", []),
+                source_group_id_to_name,
+                target_group_name_to_id,
+            )
+            desired_egress, egress_unresolved = normalize_permissions(
+                source_sg.get("IpPermissionsEgress", []),
+                source_group_id_to_name,
+                target_group_name_to_id,
+            )
+
+            current_ingress, _ = normalize_permissions(
+                target_sg.get("IpPermissions", []),
+                {},  # target-side, already target ids
+                target_group_name_to_id,
+            )
+            current_egress, _ = normalize_permissions(
+                target_sg.get("IpPermissionsEgress", []),
+                {},
+                target_group_name_to_id,
+            )
+
+            if ingress_unresolved:
+                for item in ingress_unresolved:
+                    eprint(f"[WARN] {name} ingress unresolved: {item}")
+            if egress_unresolved:
+                for item in egress_unresolved:
+                    eprint(f"[WARN] {name} egress unresolved: {item}")
+
+            if desired_ingress != current_ingress:
+                log(f"[SYNC] Updating ingress for {name} ({target_sg['GroupId']})")
+                try:
+                    revoke_all_ingress(target_ec2, target_sg["GroupId"], target_sg.get("IpPermissions", []), args.dry_run)
+                    authorize_ingress(target_ec2, target_sg["GroupId"], desired_ingress, args.dry_run)
+                except ClientError as e:
+                    eprint(f"[WARN] Failed updating ingress for {name}: {e}")
+
+            if desired_egress != current_egress:
+                log(f"[SYNC] Updating egress for {name} ({target_sg['GroupId']})")
+                try:
+                    revoke_all_egress(target_ec2, target_sg["GroupId"], target_sg.get("IpPermissionsEgress", []), args.dry_run)
+                    authorize_egress(target_ec2, target_sg["GroupId"], desired_egress, args.dry_run)
+                except ClientError as e:
+                    eprint(f"[WARN] Failed updating egress for {name}: {e}")
+
+    # final audit
+    target_by_name = get_target_sg_map(target_ec2, args.target_vpc_id)
+    target_group_name_to_id = {
+        sg["GroupName"]: sg["GroupId"]
+        for sg in target_by_name.values()
+        if sg.get("GroupId")
+    }
+
+    audit_results: List[SgAuditResult] = []
+
+    for source_sg in source_groups:
+        source_desc = source_sg.get("Description", "")
+        source_tags = canonical_tags(source_sg.get("Tags"))
+        source_ingress, _ = normalize_permissions(
+            source_sg.get("IpPermissions", []),
+            source_group_id_to_name,
+            target_group_name_to_id,
+        )
+        source_egress, _ = normalize_permissions(
+            source_sg.get("IpPermissionsEgress", []),
+            source_group_id_to_name,
+            target_group_name_to_id,
+        )
+
+        target_sg = target_by_name.get(source_sg["GroupName"])
+        if target_sg:
+            target_desc = target_sg.get("Description", "")
+            target_tags = canonical_tags(target_sg.get("Tags"))
+            target_ingress, _ = normalize_permissions(
+                target_sg.get("IpPermissions", []),
+                {},
+                target_group_name_to_id,
+            )
+            target_egress, _ = normalize_permissions(
+                target_sg.get("IpPermissionsEgress", []),
+                {},
+                target_group_name_to_id,
+            )
+        else:
+            target_desc = None
+            target_tags = None
+            target_ingress = None
+            target_egress = None
+
+        audit_results.append(
+            audit_security_group(
+                source_sg=source_sg,
+                source_desc=source_desc,
+                source_tags=source_tags,
+                source_ingress=source_ingress,
+                source_egress=source_egress,
+                target_sg=target_sg,
+                target_desc=target_desc,
+                target_tags=target_tags,
+                target_ingress=target_ingress,
+                target_egress=target_egress,
+            )
+        )
+
+    print_audit_report(audit_results)
+    write_audit_report_json(audit_results)
+
+    log("[DONE] Security group sync complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
