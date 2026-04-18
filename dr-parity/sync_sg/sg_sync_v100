@@ -1,0 +1,1863 @@
+#!/usr/bin/env python3
+
+"""
+
+sync_sg.py
+
+Reusable Python-only CLI for syncing AWS Security Groups from a source JSON export
+
+into a target DR account/VPC.
+
+Design assumptions:
+
+- Source/Prod is always provided as an exported JSON file via --json-path
+
+- Target/DR is always a live AWS account/VPC via CLI args
+
+- Source and target accounts are expected to be different
+
+- SG references are remapped by normalized name into target SG IDs
+
+- Dry-run should be used first before live execution
+
+Examples:
+
+Dry run:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --dry-run
+
+Audit only:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --report-only
+
+Live run:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --yes
+
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import json
+
+import sys
+
+import time
+
+import threading
+
+from pathlib import Path
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from dataclasses import dataclass, field, asdict
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+
+from botocore.exceptions import ClientError
+
+# --------------------------------------------------------------------
+
+# Logging
+
+# --------------------------------------------------------------------
+
+PRINT_LOCK = threading.Lock()
+
+def log(msg: str) -> None:
+
+    with PRINT_LOCK:
+
+        print(msg, flush=True)
+
+def eprint(msg: str) -> None:
+
+    with PRINT_LOCK:
+
+        print(msg, file=sys.stderr, flush=True)
+
+# --------------------------------------------------------------------
+
+# Constants
+
+# --------------------------------------------------------------------
+
+SYSTEM_TAG_KEYS_TO_IGNORE = {
+
+    "aws:cloudformation:logical-id",
+
+    "aws:cloudformation:stack-id",
+
+    "aws:cloudformation:stack-name",
+
+}
+
+DEFAULT_WORKERS = 4
+
+DEFAULT_REPORTS_DIR = "reports"
+
+# --------------------------------------------------------------------
+
+# Dataclasses
+
+# --------------------------------------------------------------------
+
+@dataclass
+
+class Args:
+
+    json_path: str
+
+    target_profile: str
+
+    target_region: str
+
+    target_vpc_id: str
+
+    dry_run: bool
+
+    report_only: bool
+
+    yes: bool
+
+    name_preview: bool
+
+    workers: int
+
+    rollback_on_error: bool
+
+    report_path: str
+
+@dataclass
+
+class SgAuditResult:
+
+    group_name: str
+
+    source_group_id: Optional[str] = None
+
+    target_group_id: Optional[str] = None
+
+    exists_in_target: bool = False
+
+    description_match: bool = True
+
+    tags_match: bool = True
+
+    ingress_match: bool = True
+
+    egress_match: bool = True
+
+    missing: List[str] = field(default_factory=list)
+
+    drift_fields: List[str] = field(default_factory=list)
+
+    notes: List[str] = field(default_factory=list)
+
+    @property
+
+    def in_sync(self) -> bool:
+
+        return (
+
+            self.exists_in_target
+
+            and self.description_match
+
+            and self.tags_match
+
+            and self.ingress_match
+
+            and self.egress_match
+
+        )
+
+@dataclass
+
+class SgSnapshot:
+
+    group_id: str
+
+    group_name: str
+
+    description: str
+
+    tags: List[Tuple[str, str]]
+
+    ingress: List[Dict[str, Any]]
+
+    egress: List[Dict[str, Any]]
+
+# --------------------------------------------------------------------
+
+# AWS Helpers
+
+# --------------------------------------------------------------------
+
+def retry_aws(func, retries: int = 5, base_sleep: float = 1.0):
+
+    last_exc = None
+
+    for attempt in range(retries):
+
+        try:
+
+            return func()
+
+        except ClientError as exc:
+
+            last_exc = exc
+
+            code = exc.response.get("Error", {}).get("Code", "")
+
+            retriable = code in {
+
+                "RequestLimitExceeded",
+
+                "Throttling",
+
+                "ThrottlingException",
+
+                "InternalError",
+
+                "ServiceUnavailable",
+
+                "Unavailable",
+
+            }
+
+            if not retriable or attempt == retries - 1:
+
+                raise
+
+            sleep_for = base_sleep * (2 ** attempt)
+
+            log(f"[RETRY] AWS call failed with {code}, retrying in {sleep_for:.1f}s")
+
+            time.sleep(sleep_for)
+
+    raise last_exc
+
+def boto3_session(profile: str, region: str):
+
+    return boto3.Session(profile_name=profile, region_name=region)
+
+def get_ec2(profile: str, region: str):
+
+    return boto3_session(profile, region).client("ec2")
+
+def get_sts(profile: str, region: str):
+
+    return boto3_session(profile, region).client("sts")
+
+def get_account_id(profile: str, region: str) -> str:
+
+    sts = get_sts(profile, region)
+
+    ident = retry_aws(lambda: sts.get_caller_identity())
+
+    return ident["Account"]
+
+# --------------------------------------------------------------------
+
+# CLI / Report path helpers
+
+# --------------------------------------------------------------------
+
+def auto_report_path(json_path: str, target_profile: str, target_region: str) -> str:
+
+    reports_dir = Path(DEFAULT_REPORTS_DIR)
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    base = Path(json_path).stem
+
+    return str(reports_dir / f"{base}_{target_profile}_{target_region}_sg_sync_report.json")
+
+def parse_args() -> Args:
+
+    parser = argparse.ArgumentParser(
+
+        description=(
+
+            "Sync AWS Security Groups from a source JSON export into a target DR account/VPC. "
+
+            "Source/Prod is supplied as --json-path. Target/DR is supplied as target CLI args."
+
+        )
+
+    )
+
+    parser.add_argument(
+
+        "--json-path",
+
+        required=True,
+
+        help="Path to exported source/Prod security groups JSON file.",
+
+    )
+
+    parser.add_argument(
+
+        "--target-profile",
+
+        required=True,
+
+        help="AWS CLI profile for the target/DR account.",
+
+    )
+
+    parser.add_argument(
+
+        "--target-region",
+
+        required=True,
+
+        help="AWS region for the target/DR account.",
+
+    )
+
+    parser.add_argument(
+
+        "--target-vpc-id",
+
+        required=True,
+
+        help="Target/DR VPC ID where security groups will be created/synced.",
+
+    )
+
+    parser.add_argument(
+
+        "--dry-run",
+
+        action="store_true",
+
+        help="Preview changes only. No modifications are made.",
+
+    )
+
+    parser.add_argument(
+
+        "--report-only",
+
+        action="store_true",
+
+        help="Audit only. Compare source vs target without modifying target.",
+
+    )
+
+    parser.add_argument(
+
+        "--yes",
+
+        action="store_true",
+
+        help="Skip confirmation prompt for live execution.",
+
+    )
+
+    parser.add_argument(
+
+        "--name-preview",
+
+        action="store_true",
+
+        help="Show source-to-target SG name mapping and exit.",
+
+    )
+
+    parser.add_argument(
+
+        "--workers",
+
+        type=int,
+
+        default=DEFAULT_WORKERS,
+
+        help=f"Parallel worker count for reconciliation. Default: {DEFAULT_WORKERS}",
+
+    )
+
+    parser.add_argument(
+
+        "--no-rollback",
+
+        action="store_true",
+
+        help="Disable automatic rollback on live failure.",
+
+    )
+
+    parser.add_argument(
+
+        "--report-path",
+
+        help="Optional custom path for the JSON report. If omitted, auto-generated under reports/.",
+
+    )
+
+    ns = parser.parse_args()
+
+    json_path = ns.json_path
+
+    if not Path(json_path).is_file():
+
+        parser.error(f"JSON source file not found: {json_path}")
+
+    workers = max(1, int(ns.workers))
+
+    rollback_on_error = not ns.no_rollback
+
+    report_path = ns.report_path or auto_report_path(json_path, ns.target_profile, ns.target_region)
+
+    # ensure parent dir exists even for custom report path
+
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+
+    return Args(
+
+        json_path=json_path,
+
+        target_profile=ns.target_profile,
+
+        target_region=ns.target_region,
+
+        target_vpc_id=ns.target_vpc_id,
+
+        dry_run=ns.dry_run,
+
+        report_only=ns.report_only,
+
+        yes=ns.yes,
+
+        name_preview=ns.name_preview,
+
+        workers=workers,
+
+        rollback_on_error=rollback_on_error,
+
+        report_path=report_path,
+
+    )
+
+# --------------------------------------------------------------------
+
+# Tag Helpers
+
+# --------------------------------------------------------------------
+
+def canonical_tags(tags: Optional[List[Dict[str, str]]]) -> List[Tuple[str, str]]:
+
+    out: List[Tuple[str, str]] = []
+
+    for t in tags or []:
+
+        key = t.get("Key", "")
+
+        val = t.get("Value", "")
+
+        if key and key not in SYSTEM_TAG_KEYS_TO_IGNORE:
+
+            out.append((key, val))
+
+    return sorted(out)
+
+def tags_to_aws_payload(tags: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+
+    return [{"Key": k, "Value": v} for k, v in tags]
+
+# --------------------------------------------------------------------
+
+# Normalization
+
+# --------------------------------------------------------------------
+
+def is_default_sg(sg: Dict[str, Any]) -> bool:
+
+    return sg.get("GroupName") == "default"
+
+def normalize_sg_name(name: str, src_acct: Optional[str], tgt_acct: Optional[str]) -> str:
+
+    if not src_acct or not tgt_acct or src_acct == tgt_acct:
+
+        return name
+
+    return name.replace(src_acct, tgt_acct, 1)
+
+# --------------------------------------------------------------------
+
+# Source Loading / Target Inventory
+
+# --------------------------------------------------------------------
+
+def load_json_security_groups(path: str) -> List[Dict[str, Any]]:
+
+    with open(path, "r", encoding="utf-8") as f:
+
+        data = json.load(f)
+
+    if isinstance(data, dict) and "SecurityGroups" in data:
+
+        if not isinstance(data["SecurityGroups"], list):
+
+            raise ValueError("JSON 'SecurityGroups' must be a list")
+
+        return data["SecurityGroups"]
+
+    if isinstance(data, list):
+
+        return data
+
+    raise ValueError("Invalid JSON format for SG list")
+
+def extract_source_account_id_from_json(source_groups: List[Dict[str, Any]]) -> Optional[str]:
+
+    """
+
+    Best-effort extraction of source account ID from JSON SG data.
+
+    Uses OwnerId if present on SG, otherwise first UserIdGroupPair UserId if present.
+
+    """
+
+    for sg in source_groups:
+
+        owner = sg.get("OwnerId")
+
+        if owner and str(owner).isdigit():
+
+            return str(owner)
+
+    for sg in source_groups:
+
+        for perm_key in ("IpPermissions", "IpPermissionsEgress"):
+
+            for perm in sg.get(perm_key, []) or []:
+
+                for pair in perm.get("UserIdGroupPairs", []) or []:
+
+                    uid = pair.get("UserId")
+
+                    if uid and str(uid).isdigit():
+
+                        return str(uid)
+
+    return None
+
+def describe_security_groups_by_vpc(ec2, vpc_id: str) -> List[Dict[str, Any]]:
+
+    paginator = ec2.get_paginator("describe_security_groups")
+
+    out: List[Dict[str, Any]] = []
+
+    for page in paginator.paginate(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]):
+
+        out.extend(page.get("SecurityGroups", []))
+
+    return out
+
+def get_target_sg_map(
+
+    ec2,
+
+    vpc_id: str,
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+) -> Dict[str, Dict[str, Any]]:
+
+    groups = describe_security_groups_by_vpc(ec2, vpc_id)
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for sg in groups:
+
+        raw = sg["GroupName"]
+
+        canon = normalize_sg_name(raw, src_acct, tgt_acct)
+
+        out[canon] = sg
+
+    return out
+
+def print_name_preview(source_groups: List[Dict[str, Any]], src_acct: Optional[str], tgt_acct: Optional[str]) -> None:
+
+    print("=" * 70)
+
+    print("SECURITY GROUP NAME PREVIEW")
+
+    print("=" * 70)
+
+    for sg in source_groups:
+
+        raw = sg["GroupName"]
+
+        new = normalize_sg_name(raw, src_acct, tgt_acct)
+
+        print(f"{raw}\n  -> {new}\n")
+
+    print("=" * 70)
+
+    print("No changes made. Preview only.")
+
+    print("=" * 70 + "\n")
+
+# --------------------------------------------------------------------
+
+# Permission Normalization
+
+# --------------------------------------------------------------------
+
+def map_user_group_pairs(
+
+    pairs: List[Dict[str, Any]],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+
+    mapped: List[Dict[str, Any]] = []
+
+    unresolved: List[str] = []
+
+    for pair in pairs or []:
+
+        gid = pair.get("GroupId")
+
+        if not gid:
+
+            unresolved.append("UserIdGroupPair missing GroupId")
+
+            continue
+
+        name = src_id_to_name.get(gid)
+
+        if not name:
+
+            unresolved.append(f"No source SG name for {gid}")
+
+            continue
+
+        canon = normalize_sg_name(name, src_acct, tgt_acct)
+
+        tgt_gid = tgt_name_to_id.get(canon)
+
+        if not tgt_gid:
+
+            unresolved.append(f"No target SG for {canon}")
+
+            continue
+
+        new_pair = {"GroupId": tgt_gid}
+
+        if pair.get("Description") is not None:
+
+            new_pair["Description"] = pair["Description"]
+
+        mapped.append(new_pair)
+
+    return sorted(mapped, key=lambda x: x["GroupId"]), unresolved
+
+def normalize_permission(
+
+    perm: Dict[str, Any],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+) -> Tuple[Dict[str, Any], List[str]]:
+
+    unresolved: List[str] = []
+
+    norm: Dict[str, Any] = {"IpProtocol": perm.get("IpProtocol")}
+
+    if perm.get("FromPort") is not None:
+
+        norm["FromPort"] = perm["FromPort"]
+
+    if perm.get("ToPort") is not None:
+
+        norm["ToPort"] = perm["ToPort"]
+
+    def copy_ranges(key: str, cidr_key: str) -> List[Dict[str, Any]]:
+
+        out = []
+
+        for item in perm.get(key, []) or []:
+
+            entry = {cidr_key: item[cidr_key]}
+
+            if item.get("Description") is not None:
+
+                entry["Description"] = item["Description"]
+
+            out.append(entry)
+
+        return sorted(out, key=lambda x: (x.get(cidr_key), x.get("Description", "")))
+
+    norm["IpRanges"] = copy_ranges("IpRanges", "CidrIp")
+
+    norm["Ipv6Ranges"] = copy_ranges("Ipv6Ranges", "CidrIpv6")
+
+    norm["PrefixListIds"] = copy_ranges("PrefixListIds", "PrefixListId")
+
+    mapped, unr = map_user_group_pairs(
+
+        perm.get("UserIdGroupPairs", []),
+
+        src_id_to_name,
+
+        tgt_name_to_id,
+
+        src_acct,
+
+        tgt_acct,
+
+    )
+
+    if mapped:
+
+        norm["UserIdGroupPairs"] = mapped
+
+    unresolved.extend(unr)
+
+    return norm, unresolved
+
+def normalize_permissions(
+
+    perms: List[Dict[str, Any]],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+
+    out: List[Dict[str, Any]] = []
+
+    unresolved: List[str] = []
+
+    for p in perms or []:
+
+        norm, unr = normalize_permission(p, src_id_to_name, tgt_name_to_id, src_acct, tgt_acct)
+
+        out.append(norm)
+
+        unresolved.extend(unr)
+
+    out = sorted(out, key=lambda x: json.dumps(x, sort_keys=True))
+
+    return out, unresolved
+
+def diff_permissions(
+
+    desired: List[Dict[str, Any]],
+
+    current: List[Dict[str, Any]],
+
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+    to_add = [p for p in desired if p not in current]
+
+    to_remove = [p for p in current if p not in desired]
+
+    return to_add, to_remove
+
+# --------------------------------------------------------------------
+
+# Sync Helpers
+
+# --------------------------------------------------------------------
+
+def create_or_get_sg(
+
+    ec2,
+
+    source_sg: Dict[str, Any],
+
+    vpc_id: str,
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+    dry_run: bool,
+
+) -> str:
+
+    raw = source_sg["GroupName"]
+
+    name = normalize_sg_name(raw, src_acct, tgt_acct)
+
+    existing = retry_aws(
+
+        lambda: ec2.describe_security_groups(
+
+            Filters=[
+
+                {"Name": "vpc-id", "Values": [vpc_id]},
+
+                {"Name": "group-name", "Values": [name]},
+
+            ]
+
+        )
+
+    ).get("SecurityGroups", [])
+
+    if existing:
+
+        return existing[0]["GroupId"]
+
+    desc = source_sg.get("Description", f"Synced SG: {name}")
+
+    if dry_run:
+
+        log(f"[DRY-RUN] Would create SG: {name}")
+
+        return f"dryrun:{name}"
+
+    try:
+
+        resp = retry_aws(
+
+            lambda: ec2.create_security_group(
+
+                GroupName=name,
+
+                Description=(desc or name)[:255],
+
+                VpcId=vpc_id,
+
+            )
+
+        )
+
+        gid = resp["GroupId"]
+
+        log(f"[CREATE] SG created: {name} ({gid})")
+
+        return gid
+
+    except ClientError as exc:
+
+        code = exc.response.get("Error", {}).get("Code", "")
+
+        if code == "InvalidGroup.Duplicate":
+
+            existing = retry_aws(
+
+                lambda: ec2.describe_security_groups(
+
+                    Filters=[
+
+                        {"Name": "vpc-id", "Values": [vpc_id]},
+
+                        {"Name": "group-name", "Values": [name]},
+
+                    ]
+
+                )
+
+            ).get("SecurityGroups", [])
+
+            if existing:
+
+                return existing[0]["GroupId"]
+
+        raise
+
+def sync_tags(ec2, gid: str, desired: List[Tuple[str, str]], current: List[Tuple[str, str]], dry_run: bool) -> None:
+
+    if desired == current:
+
+        return
+
+    log(f"[SYNC] Tags differ for {gid}")
+
+    if dry_run:
+
+        log(f"[DRY-RUN] Current tags: {current}")
+
+        log(f"[DRY-RUN] Desired tags: {desired}")
+
+        return
+
+    if desired:
+
+        retry_aws(lambda: ec2.create_tags(Resources=[gid], Tags=tags_to_aws_payload(desired)))
+
+    current_keys = {k for k, _ in current}
+
+    desired_keys = {k for k, _ in desired}
+
+    to_remove = current_keys - desired_keys
+
+    if to_remove:
+
+        retry_aws(
+
+            lambda: ec2.delete_tags(
+
+                Resources=[gid],
+
+                Tags=[{"Key": k} for k in sorted(to_remove)],
+
+            )
+
+        )
+
+def revoke_permissions(ec2, gid: str, perms: List[Dict[str, Any]], direction: str, dry_run: bool) -> None:
+
+    if not perms:
+
+        return
+
+    if dry_run:
+
+        log(f"[DRY-RUN] Would revoke {direction} on {gid}: {json.dumps(perms, default=str)}")
+
+        return
+
+    try:
+
+        if direction == "ingress":
+
+            retry_aws(lambda: ec2.revoke_security_group_ingress(GroupId=gid, IpPermissions=perms))
+
+        else:
+
+            retry_aws(lambda: ec2.revoke_security_group_egress(GroupId=gid, IpPermissions=perms))
+
+    except ClientError as exc:
+
+        raise RuntimeError(f"Failed revoking {direction} on {gid}: {exc}") from exc
+
+def authorize_permissions(ec2, gid: str, perms: List[Dict[str, Any]], direction: str, dry_run: bool) -> None:
+
+    if not perms:
+
+        return
+
+    if dry_run:
+
+        log(f"[DRY-RUN] Would authorize {direction} on {gid}: {json.dumps(perms, default=str)}")
+
+        return
+
+    try:
+
+        if direction == "ingress":
+
+            retry_aws(lambda: ec2.authorize_security_group_ingress(GroupId=gid, IpPermissions=perms))
+
+        else:
+
+            retry_aws(lambda: ec2.authorize_security_group_egress(GroupId=gid, IpPermissions=perms))
+
+    except ClientError as exc:
+
+        msg = str(exc)
+
+        code = exc.response.get("Error", {}).get("Code", "")
+
+        if "InvalidPermission.Duplicate" in msg or code == "InvalidPermission.Duplicate":
+
+            log(f"[WARN] Duplicate {direction} permission ignored on {gid}")
+
+            return
+
+        raise RuntimeError(f"Failed authorizing {direction} on {gid}: {exc}") from exc
+
+# --------------------------------------------------------------------
+
+# Audit / Summary
+
+# --------------------------------------------------------------------
+
+def audit_sg(
+
+    source_sg: Dict[str, Any],
+
+    src_desc: str,
+
+    src_tags: List[Tuple[str, str]],
+
+    src_ing: List[Dict[str, Any]],
+
+    src_eg: List[Dict[str, Any]],
+
+    tgt_sg: Optional[Dict[str, Any]],
+
+    tgt_desc: str,
+
+    tgt_tags: List[Tuple[str, str]],
+
+    tgt_ing: List[Dict[str, Any]],
+
+    tgt_eg: List[Dict[str, Any]],
+
+) -> SgAuditResult:
+
+    r = SgAuditResult(
+
+        group_name=source_sg["GroupName"],
+
+        source_group_id=source_sg.get("GroupId"),
+
+        target_group_id=tgt_sg.get("GroupId") if tgt_sg else None,
+
+        exists_in_target=bool(tgt_sg),
+
+    )
+
+    if not tgt_sg:
+
+        r.missing.append("Missing in target")
+
+        return r
+
+    if src_desc != tgt_desc:
+
+        r.description_match = False
+
+        r.drift_fields.append("Description")
+
+    if src_tags != tgt_tags:
+
+        r.tags_match = False
+
+        r.drift_fields.append("Tags")
+
+    if src_ing != tgt_ing:
+
+        r.ingress_match = False
+
+        r.drift_fields.append("Ingress")
+
+    if src_eg != tgt_eg:
+
+        r.egress_match = False
+
+        r.drift_fields.append("Egress")
+
+    return r
+
+def print_summary(results: List[SgAuditResult]) -> None:
+
+    total = len(results)
+
+    in_sync = sum(1 for r in results if r.in_sync)
+
+    out_sync = total - in_sync
+
+    missing = [r for r in results if not r.exists_in_target]
+
+    drift = [r for r in results if r.exists_in_target and not r.in_sync]
+
+    print("\n" + "=" * 80)
+
+    print("SECURITY GROUP SYNC SUMMARY")
+
+    print("=" * 80)
+
+    print(f"Total SGs processed : {total}")
+
+    print(f"In sync             : {in_sync}")
+
+    print(f"Out of sync         : {out_sync}")
+
+    print(f"Missing in target   : {len(missing)}")
+
+    print(f"Drift detected      : {len(drift)}\n")
+
+    if missing:
+
+        print("Missing SGs:")
+
+        for r in missing:
+
+            print(f" - {r.group_name}")
+
+    if drift:
+
+        print("\nSGs with drift:")
+
+        for r in drift:
+
+            fields = ", ".join(r.drift_fields) if r.drift_fields else "Unknown"
+
+            print(f" - {r.group_name} (fields: {fields})")
+
+    print("=" * 80 + "\n")
+
+def print_audit_report(results: List[SgAuditResult]) -> None:
+
+    for r in results:
+
+        print("-" * 80)
+
+        print(f"SG              : {r.group_name}")
+
+        print(f"Source SG ID    : {r.source_group_id}")
+
+        print(f"Target SG ID    : {r.target_group_id}")
+
+        print(f"Exists          : {r.exists_in_target}")
+
+        print(f"Description     : {'OK' if r.description_match else 'MISMATCH'}")
+
+        print(f"Tags            : {'OK' if r.tags_match else 'MISMATCH'}")
+
+        print(f"Ingress         : {'OK' if r.ingress_match else 'MISMATCH'}")
+
+        print(f"Egress          : {'OK' if r.egress_match else 'MISMATCH'}")
+
+        if r.missing:
+
+            print("Missing:")
+
+            for m in r.missing:
+
+                print(f" - {m}")
+
+        if r.drift_fields:
+
+            print("Drift fields:")
+
+            for f in r.drift_fields:
+
+                print(f" - {f}")
+
+        if r.notes:
+
+            print("Notes:")
+
+            for n in r.notes:
+
+                print(f" - {n}")
+
+    print("-" * 80)
+
+# --------------------------------------------------------------------
+
+# Snapshot / Rollback
+
+# --------------------------------------------------------------------
+
+def snapshot_target_sg(
+
+    sg: Dict[str, Any],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+) -> SgSnapshot:
+
+    ingress, _ = normalize_permissions(
+
+        sg.get("IpPermissions", []),
+
+        src_id_to_name,
+
+        tgt_name_to_id,
+
+        src_acct,
+
+        tgt_acct,
+
+    )
+
+    egress, _ = normalize_permissions(
+
+        sg.get("IpPermissionsEgress", []),
+
+        src_id_to_name,
+
+        tgt_name_to_id,
+
+        src_acct,
+
+        tgt_acct,
+
+    )
+
+    return SgSnapshot(
+
+        group_id=sg["GroupId"],
+
+        group_name=sg["GroupName"],
+
+        description=sg.get("Description", ""),
+
+        tags=canonical_tags(sg.get("Tags")),
+
+        ingress=ingress,
+
+        egress=egress,
+
+    )
+
+def restore_sg_to_snapshot(ec2, snapshot: SgSnapshot, current_sg: Dict[str, Any], dry_run: bool) -> None:
+
+    gid = snapshot.group_id
+
+    current_tags = canonical_tags(current_sg.get("Tags"))
+
+    sync_tags(ec2, gid, snapshot.tags, current_tags, dry_run)
+
+    def passthrough_norm(perms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
+        out = []
+
+        for perm in perms:
+
+            norm: Dict[str, Any] = {"IpProtocol": perm.get("IpProtocol")}
+
+            if perm.get("FromPort") is not None:
+
+                norm["FromPort"] = perm["FromPort"]
+
+            if perm.get("ToPort") is not None:
+
+                norm["ToPort"] = perm["ToPort"]
+
+            def copy_ranges(key: str, cidr_key: str) -> List[Dict[str, Any]]:
+
+                items = []
+
+                for x in perm.get(key, []) or []:
+
+                    item = {cidr_key: x[cidr_key]}
+
+                    if x.get("Description") is not None:
+
+                        item["Description"] = x["Description"]
+
+                    items.append(item)
+
+                return sorted(items, key=lambda z: (z.get(cidr_key), z.get("Description", "")))
+
+            norm["IpRanges"] = copy_ranges("IpRanges", "CidrIp")
+
+            norm["Ipv6Ranges"] = copy_ranges("Ipv6Ranges", "CidrIpv6")
+
+            norm["PrefixListIds"] = copy_ranges("PrefixListIds", "PrefixListId")
+
+            ugp = []
+
+            for pair in perm.get("UserIdGroupPairs", []) or []:
+
+                if pair.get("GroupId"):
+
+                    item = {"GroupId": pair["GroupId"]}
+
+                    if pair.get("Description") is not None:
+
+                        item["Description"] = pair["Description"]
+
+                    ugp.append(item)
+
+            if ugp:
+
+                norm["UserIdGroupPairs"] = sorted(ugp, key=lambda z: z["GroupId"])
+
+            out.append(norm)
+
+        return sorted(out, key=lambda x: json.dumps(x, sort_keys=True))
+
+    current_ing_norm = passthrough_norm(current_sg.get("IpPermissions", []) or [])
+
+    current_eg_norm = passthrough_norm(current_sg.get("IpPermissionsEgress", []) or [])
+
+    to_add_ing, to_remove_ing = diff_permissions(snapshot.ingress, current_ing_norm)
+
+    to_add_eg, to_remove_eg = diff_permissions(snapshot.egress, current_eg_norm)
+
+    revoke_permissions(ec2, gid, to_remove_ing, "ingress", dry_run)
+
+    authorize_permissions(ec2, gid, to_add_ing, "ingress", dry_run)
+
+    revoke_permissions(ec2, gid, to_remove_eg, "egress", dry_run)
+
+    authorize_permissions(ec2, gid, to_add_eg, "egress", dry_run)
+
+def rollback_changes(
+
+    ec2,
+
+    snapshots: Dict[str, SgSnapshot],
+
+    changed_group_ids: List[str],
+
+    dry_run: bool,
+
+) -> None:
+
+    log("\n[ROLLBACK] Starting rollback of changed security groups...")
+
+    for gid in reversed(changed_group_ids):
+
+        snapshot = snapshots.get(gid)
+
+        if not snapshot:
+
+            log(f"[ROLLBACK] No snapshot for {gid}; skipping")
+
+            continue
+
+        try:
+
+            sg = retry_aws(lambda: ec2.describe_security_groups(GroupIds=[gid]))["SecurityGroups"][0]
+
+            restore_sg_to_snapshot(ec2, snapshot, sg, dry_run)
+
+            log(f"[ROLLBACK] Restored {snapshot.group_name} ({gid})")
+
+        except Exception as exc:
+
+            eprint(f"[ROLLBACK-ERROR] Failed restoring {gid}: {exc}")
+
+    log("[ROLLBACK] Completed.")
+
+# --------------------------------------------------------------------
+
+# Reconciliation
+
+# --------------------------------------------------------------------
+
+def ensure_all_target_sgs_exist(
+
+    source_groups: List[Dict[str, Any]],
+
+    ec2_tgt,
+
+    tgt_map: Dict[str, Dict[str, Any]],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+    args: Args,
+
+) -> None:
+
+    for sg in source_groups:
+
+        raw_name = sg["GroupName"]
+
+        canon_name = normalize_sg_name(raw_name, src_acct, tgt_acct)
+
+        if canon_name not in tgt_map and not args.report_only:
+
+            gid = create_or_get_sg(ec2_tgt, sg, args.target_vpc_id, src_acct, tgt_acct, args.dry_run)
+
+            if not args.dry_run:
+
+                tgt_map[canon_name] = retry_aws(
+
+                    lambda gid=gid: ec2_tgt.describe_security_groups(GroupIds=[gid])
+
+                )["SecurityGroups"][0]
+
+def reconcile_one_sg(
+
+    sg: Dict[str, Any],
+
+    ec2_tgt,
+
+    tgt_map: Dict[str, Dict[str, Any]],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+    args: Args,
+
+) -> Tuple[SgAuditResult, Optional[str]]:
+
+    raw_name = sg["GroupName"]
+
+    canon_name = normalize_sg_name(raw_name, src_acct, tgt_acct)
+
+    tgt_sg = tgt_map.get(canon_name)
+
+    src_ing, src_ing_unresolved = normalize_permissions(
+
+        sg.get("IpPermissions", []),
+
+        src_id_to_name,
+
+        tgt_name_to_id,
+
+        src_acct,
+
+        tgt_acct,
+
+    )
+
+    src_eg, src_eg_unresolved = normalize_permissions(
+
+        sg.get("IpPermissionsEgress", []),
+
+        src_id_to_name,
+
+        tgt_name_to_id,
+
+        src_acct,
+
+        tgt_acct,
+
+    )
+
+    src_tags = canonical_tags(sg.get("Tags"))
+
+    src_desc = sg.get("Description", "")
+
+    if tgt_sg:
+
+        tgt_ing, _ = normalize_permissions(
+
+            tgt_sg.get("IpPermissions", []),
+
+            src_id_to_name,
+
+            tgt_name_to_id,
+
+            src_acct,
+
+            tgt_acct,
+
+        )
+
+        tgt_eg, _ = normalize_permissions(
+
+            tgt_sg.get("IpPermissionsEgress", []),
+
+            src_id_to_name,
+
+            tgt_name_to_id,
+
+            src_acct,
+
+            tgt_acct,
+
+        )
+
+        tgt_tags = canonical_tags(tgt_sg.get("Tags"))
+
+        tgt_desc = tgt_sg.get("Description", "")
+
+    else:
+
+        tgt_ing, tgt_eg, tgt_tags, tgt_desc = [], [], [], ""
+
+    audit = audit_sg(
+
+        sg, src_desc, src_tags, src_ing, src_eg,
+
+        tgt_sg, tgt_desc, tgt_tags, tgt_ing, tgt_eg,
+
+    )
+
+    if src_ing_unresolved:
+
+        audit.notes.extend(src_ing_unresolved)
+
+    if src_eg_unresolved:
+
+        audit.notes.extend(src_eg_unresolved)
+
+    if args.report_only or not tgt_sg:
+
+        return audit, None
+
+    gid = tgt_sg["GroupId"]
+
+    changed = False
+
+    if src_desc != tgt_desc:
+
+        audit.notes.append("Group description drift detected; existing SG description is not mutated by this tool.")
+
+    if src_tags != tgt_tags:
+
+        sync_tags(ec2_tgt, gid, src_tags, tgt_tags, args.dry_run)
+
+        changed = True
+
+    add_ing, remove_ing = diff_permissions(src_ing, tgt_ing)
+
+    if add_ing or remove_ing:
+
+        log(f"[SYNC] Ingress differs for {canon_name}")
+
+        revoke_permissions(ec2_tgt, gid, remove_ing, "ingress", args.dry_run)
+
+        authorize_permissions(ec2_tgt, gid, add_ing, "ingress", args.dry_run)
+
+        changed = True
+
+    add_eg, remove_eg = diff_permissions(src_eg, tgt_eg)
+
+    if add_eg or remove_eg:
+
+        log(f"[SYNC] Egress differs for {canon_name}")
+
+        revoke_permissions(ec2_tgt, gid, remove_eg, "egress", args.dry_run)
+
+        authorize_permissions(ec2_tgt, gid, add_eg, "egress", args.dry_run)
+
+        changed = True
+
+    return audit, (gid if changed else None)
+
+def parallel_reconcile(
+
+    source_groups: List[Dict[str, Any]],
+
+    ec2_tgt,
+
+    tgt_map: Dict[str, Dict[str, Any]],
+
+    src_id_to_name: Dict[str, str],
+
+    tgt_name_to_id: Dict[str, str],
+
+    src_acct: Optional[str],
+
+    tgt_acct: str,
+
+    args: Args,
+
+) -> List[SgAuditResult]:
+
+    audit_results: List[SgAuditResult] = []
+
+    changed_group_ids: List[str] = []
+
+    snapshots: Dict[str, SgSnapshot] = {}
+
+    for sg in tgt_map.values():
+
+        snapshots[sg["GroupId"]] = snapshot_target_sg(
+
+            sg, src_id_to_name, tgt_name_to_id, src_acct, tgt_acct
+
+        )
+
+    first_error: Optional[Exception] = None
+
+    futures = []
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+
+        for sg in source_groups:
+
+            futures.append(
+
+                executor.submit(
+
+                    reconcile_one_sg,
+
+                    sg,
+
+                    ec2_tgt,
+
+                    tgt_map,
+
+                    src_id_to_name,
+
+                    tgt_name_to_id,
+
+                    src_acct,
+
+                    tgt_acct,
+
+                    args,
+
+                )
+
+            )
+
+        for future in as_completed(futures):
+
+            try:
+
+                audit, changed_gid = future.result()
+
+                audit_results.append(audit)
+
+                if changed_gid:
+
+                    changed_group_ids.append(changed_gid)
+
+            except Exception as exc:
+
+                first_error = exc
+
+                eprint(f"[ERROR] Worker failed: {exc}")
+
+                break
+
+    if first_error:
+
+        if args.rollback_on_error and not args.dry_run and not args.report_only:
+
+            rollback_changes(ec2_tgt, snapshots, changed_group_ids, dry_run=False)
+
+        raise RuntimeError(f"Parallel sync failed: {first_error}") from first_error
+
+    audit_results.sort(key=lambda r: r.group_name)
+
+    return audit_results
+
+# --------------------------------------------------------------------
+
+# Report Writing
+
+# --------------------------------------------------------------------
+
+def write_json_report(results: List[SgAuditResult], json_report_path: str) -> None:
+
+    summary = {
+
+        "total": len(results),
+
+        "in_sync": sum(1 for r in results if r.in_sync),
+
+        "out_of_sync": sum(1 for r in results if not r.in_sync),
+
+        "missing": [r.group_name for r in results if not r.exists_in_target],
+
+        "drift": [
+
+            {
+
+                "group_name": r.group_name,
+
+                "fields": r.drift_fields,
+
+            }
+
+            for r in results
+
+            if r.exists_in_target and not r.in_sync
+
+        ],
+
+    }
+
+    full_report = {
+
+        "summary": summary,
+
+        "security_groups": [asdict(r) | {"in_sync": r.in_sync} for r in results],
+
+    }
+
+    with open(json_report_path, "w", encoding="utf-8") as jf:
+
+        json.dump(full_report, jf, indent=2)
+
+    print(f"[INFO] JSON report written to {json_report_path}")
+
+# --------------------------------------------------------------------
+
+# Main
+
+# --------------------------------------------------------------------
+
+def main() -> int:
+
+    args = parse_args()
+
+    try:
+
+        source_groups = load_json_security_groups(args.json_path)
+
+    except Exception as exc:
+
+        eprint(f"[ERROR] Failed to load source JSON: {exc}")
+
+        return 1
+
+    source_groups = [sg for sg in source_groups if not is_default_sg(sg)]
+
+    src_acct = extract_source_account_id_from_json(source_groups)
+
+    tgt_acct = None
+
+    log(f"[INFO] Validating target AWS profile: {args.target_profile}")
+
+    try:
+
+        tgt_acct = get_account_id(args.target_profile, args.target_region)
+
+    except Exception as exc:
+
+        eprint(f"[ERROR] Failed to validate target AWS access: {exc}")
+
+        return 1
+
+    log(f"[INFO] Source JSON: {args.json_path}")
+
+    log(f"[INFO] Source account (best effort from JSON): {src_acct}")
+
+    log(f"[INFO] Target account: {tgt_acct}")
+
+    log(f"[INFO] Target region: {args.target_region}")
+
+    log(f"[INFO] Target VPC: {args.target_vpc_id}")
+
+    log(f"[INFO] Worker count: {args.workers}")
+
+    log(f"[INFO] Source SG count (excluding default): {len(source_groups)}")
+
+    log(f"[INFO] Report path: {args.report_path}")
+
+    if args.name_preview:
+
+        print_name_preview(source_groups, src_acct, tgt_acct)
+
+        return 0
+
+    if not args.dry_run and not args.report_only and not args.yes:
+
+        confirm = input(
+
+            "⚠️  This will modify security groups in the target account. "
+
+            "Type 'yes' to continue: "
+
+        )
+
+        if confirm.strip().lower() != "yes":
+
+            print("Aborted.")
+
+            return 1
+
+    try:
+
+        ec2_tgt = get_ec2(args.target_profile, args.target_region)
+
+        tgt_map = get_target_sg_map(ec2_tgt, args.target_vpc_id, src_acct, tgt_acct)
+
+        src_id_to_name = {
+
+            sg["GroupId"]: sg["GroupName"]
+
+            for sg in source_groups
+
+            if sg.get("GroupId")
+
+        }
+
+        ensure_all_target_sgs_exist(source_groups, ec2_tgt, tgt_map, src_acct, tgt_acct, args)
+
+        if not args.dry_run:
+
+            tgt_map = get_target_sg_map(ec2_tgt, args.target_vpc_id, src_acct, tgt_acct)
+
+        tgt_name_to_id = {name: sg["GroupId"] for name, sg in tgt_map.items()}
+
+        audit_results = parallel_reconcile(
+
+            source_groups=source_groups,
+
+            ec2_tgt=ec2_tgt,
+
+            tgt_map=tgt_map,
+
+            src_id_to_name=src_id_to_name,
+
+            tgt_name_to_id=tgt_name_to_id,
+
+            src_acct=src_acct,
+
+            tgt_acct=tgt_acct,
+
+            args=args,
+
+        )
+
+        print_summary(audit_results)
+
+        print_audit_report(audit_results)
+
+        write_json_report(audit_results, args.report_path)
+
+        return 0
+
+    except Exception as exc:
+
+        eprint(f"[ERROR] Sync failed: {exc}")
+
+        return 1
+
+if __name__ == "__main__":
+
+    sys.exit(main())
