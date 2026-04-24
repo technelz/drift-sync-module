@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
 “””
-
 sync_sg.py
 
 Reusable Python-only CLI for syncing AWS Security Groups from a source JSON export
-
 into a target DR account/VPC.
 
 Design assumptions:
@@ -201,7 +199,7 @@ notes: List[str] = field(default_factory=list)
 ```
 @property
 def in_sync(self) -> bool:
-    return self.exists_in_target and not self.drift_fields and not self.mi
+    return self.exists_in_target and not self.drift_fields and not self.missing
 ```
 
 # ——————————————————————————
@@ -287,15 +285,15 @@ name = re.sub(
 )
 
 # 5. Strip leading account-number prefixes:
-#    123456789012-<name>
+#    123456789012-<n>
 name = re.sub(r"^[0-9]{6,12}[-_]", "", name)
 
 # 6. Strip trailing CFN resource hash:
-#    <name>-ABC12345
+#    <n>-ABC12345
 name = re.sub(r"-[a-z0-9]{8,}$", "", name)
 
 # 7. Strip trailing env suffixes:
-#    <name>-dev, <name>-prod, <name>-12345
+#    <n>-dev, <n>-prod, <n>-12345
 name = re.sub(
     r"-(dev|prod|qa|uat|stage|stg|test|acc|acct|env|[0-9]+)$",
     "",
@@ -303,7 +301,7 @@ name = re.sub(
 )
 
 # 8. Collapse multiple separators
-# (continuation assumed from image)
+name = re.sub(r"[-_]{2,}", "-", name)
 
 # 9. Final cleanup
 name = name.strip("-_ ")
@@ -318,7 +316,7 @@ return name
 # ——————————————————————————
 
 def get_target_sg_map(ec2, vpc_id, src_acct, tgt_acct):
-response = ec2.describe_security_groups(Filters=[{“Name”: “vpc-id”, “Values”
+response = ec2.describe_security_groups(Filters=[{“Name”: “vpc-id”, “Values”: [vpc_id]}])
 
 ```
 tgt_map = {}
@@ -370,6 +368,115 @@ for p in perms or []:
         "IpRanges": sorted(p.get("IpRanges", []), key=str),
         "Ipv6Ranges": sorted(p.get("Ipv6Ranges", []), key=str),
         "PrefixListIds": sorted(p.get("PrefixListIds", []), key=str),
+    }
+    normalized.append(norm)
+
+return sorted(normalized, key=str)
+```
+
+# ——————————————————————————
+
+# AUDIT CORE
+
+# ——————————————————————————
+
+def audit_sg(
+src_sg: Dict[str, Any],
+tgt_sg: Optional[Dict[str, Any]],
+src_acct: str,
+tgt_acct: str,
+) -> SgAuditResult:
+name = src_sg[“GroupName”]
+result = SgAuditResult(
+group_name=name,
+source_group_id=src_sg.get(“GroupId”),
+)
+
+```
+if tgt_sg is None:
+    result.missing.append("group")
+    return result
+
+result.exists_in_target = True
+result.target_group_id = tgt_sg.get("GroupId")
+
+# Check ingress rules
+src_ingress = normalize_permissions(src_sg.get("IpPermissions", []))
+tgt_ingress = normalize_permissions(tgt_sg.get("IpPermissions", []))
+if src_ingress != tgt_ingress:
+    result.drift_fields.append("ingress")
+
+# Check egress rules
+src_egress = normalize_permissions(src_sg.get("IpPermissionsEgress", []))
+tgt_egress = normalize_permissions(tgt_sg.get("IpPermissionsEgress", []))
+if src_egress != tgt_egress:
+    result.drift_fields.append("egress")
+
+# Check tags
+src_tags = canonical_tags(src_sg.get("Tags", []))
+tgt_tags = canonical_tags(tgt_sg.get("Tags", []))
+if src_tags != tgt_tags:
+    result.drift_fields.append("tags")
+
+return result
+```
+
+# ——————————————————————————
+
+# PLAN (AUDIT WRAPPER)
+
+# ——————————————————————————
+
+@dataclass
+class Plan:
+changes: List[SgAuditResult] = field(default_factory=list)
+
+def build_plan(
+source_groups: List[Dict[str, Any]],
+target_map: Dict[str, Any],
+src_acct: str,
+tgt_acct: str,
+) -> Plan:
+plan = Plan()
+
+```
+for src_sg in source_groups:
+    raw = src_sg["GroupName"]
+    canon = normalize_sg_name(raw, src_acct, tgt_acct)
+    tgt_sg = target_map.get(canon)
+    result = audit_sg(src_sg, tgt_sg, src_acct, tgt_acct)
+    plan.changes.append(result)
+
+return plan
+```
+
+# ——————————————————————————
+
+# SUMMARY COMPUTE
+
+# ——————————————————————————
+
+def compute_summary(results: List[SgAuditResult]) -> Dict[str, Any]:
+total = len(results)
+in_sync = sum(1 for r in results if r.in_sync)
+drift = sum(1 for r in results if r.exists_in_target and r.drift_fields)
+missing = sum(1 for r in results if not r.exists_in_target)
+
+```
+missing_list = [r.group_name for r in results if not r.exists_in_target]
+drift_list = [
+    {"group": r.group_name, "fields": r.drift_fields}
+    for r in results if r.exists_in_target and r.drift_fields
+]
+
+return {
+    "total": total,
+    "in_sync": in_sync,
+    "drift": drift,
+    "missing": missing,
+    "missing_list": missing_list,
+    "drift_list": drift_list,
+}
 ```
 
 # ——————————————————————————
