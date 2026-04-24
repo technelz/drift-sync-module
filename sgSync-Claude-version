@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+“””
+sg_sync.py — One-way Security Group parity sync (Source → DR)
+
+Usage:
+python sg_sync.py –json sg_export.json –config naming_rules.json   
+–dr-profile dr-account –dr-region us-west-2   
+–dr-vpc vpc-XXXXXXXXX [–dry-run]
+“””
+
+import argparse
+import json
+import sys
+import boto3
+from botocore.exceptions import ClientError
+
+# ── Naming ─────────────────────────────────────────────────────────────────────
+
+def derive_dr_name(source_name: str, rules: list[dict]) -> str:
+“””
+Walk through naming rules in order and return the first match.
+Each rule in naming_rules.json looks like:
+{
+“match”: “startswith”,   // startswith | endswith | contains | regex | any
+“value”: “stack-”,
+“transform”: “prefix”,   // prefix | suffix | replace_prefix | replace_suffix
+“with”: “dr-”
+}
+“””
+import re
+
+```
+for rule in rules:
+    match_type = rule["match"]
+    value      = rule.get("value", "")
+
+    matched = False
+    if match_type == "any":
+        matched = True
+    elif match_type == "startswith":
+        matched = source_name.startswith(value)
+    elif match_type == "endswith":
+        matched = source_name.endswith(value)
+    elif match_type == "contains":
+        matched = value in source_name
+    elif match_type == "regex":
+        matched = bool(re.search(value, source_name))
+
+    if matched:
+        transform = rule["transform"]
+        with_val  = rule["with"]
+
+        if transform == "prefix":
+            return f"{with_val}{source_name}"
+        elif transform == "suffix":
+            return f"{source_name}{with_val}"
+        elif transform == "replace_prefix":
+            return f"{with_val}{source_name[len(value):]}"
+        elif transform == "replace_suffix":
+            return f"{source_name[:-len(value)]}{with_val}"
+
+# Fallback — no rule matched
+raise ValueError(
+    f"No naming rule matched '{source_name}'. "
+    "Add a catch-all rule with \"match\": \"any\" at the end of your config."
+)
+```
+
+# ── Rule helpers ───────────────────────────────────────────────────────────────
+
+def _rule_key(rule: dict) -> tuple:
+“”“Hashable identity for an IP permission rule (protocol + port range + CIDRs).”””
+protocol  = rule.get(“IpProtocol”, “-1”)
+from_port = rule.get(“FromPort”, -1)
+to_port   = rule.get(“ToPort”,   -1)
+cidrs_v4  = frozenset(r[“CidrIp”]   for r in rule.get(“IpRanges”,   []))
+cidrs_v6  = frozenset(r[“CidrIpv6”] for r in rule.get(“Ipv6Ranges”, []))
+return (protocol, from_port, to_port, cidrs_v4, cidrs_v6)
+
+def _sanitize_rules(rules: list[dict]) -> list[dict]:
+“”“Remove UserIdGroupPairs — SG IDs don’t transfer across accounts.”””
+sanitized = []
+for rule in rules:
+r = {k: v for k, v in rule.items() if k != “UserIdGroupPairs”}
+if rule.get(“UserIdGroupPairs”):
+names = [p.get(“GroupId”, “?”) for p in rule[“UserIdGroupPairs”]]
+print(f”   ⚠️  Stripped cross-account SG reference(s): {names}”)
+sanitized.append(r)
+return sanitized
+
+def _is_default_egress(rule: dict) -> bool:
+return (
+rule.get(“IpProtocol”) == “-1”
+and any(ip.get(“CidrIp”) == “0.0.0.0/0” for ip in rule.get(“IpRanges”, []))
+)
+
+def _missing_rules(source_rules: list[dict], dr_rules: list[dict]) -> list[dict]:
+“”“Return source rules that are absent from DR (by key identity).”””
+dr_keys = {_rule_key(r) for r in dr_rules}
+return [r for r in source_rules if _rule_key(r) not in dr_keys]
+
+# ── Core sync ──────────────────────────────────────────────────────────────────
+
+def get_sg_by_name(ec2_client, name: str) -> dict | None:
+resp = ec2_client.describe_security_groups(
+Filters=[{“Name”: “group-name”, “Values”: [name]}]
+)
+sgs = resp[“SecurityGroups”]
+return sgs[0] if sgs else None
+
+def create_sg(ec2_client, source_sg: dict, dr_name: str,
+dr_vpc_id: str, dry_run: bool) -> str | None:
+print(f”   ➕ Would create SG: {dr_name}” if dry_run else f”   ➕ Creating SG: {dr_name}”)
+
+```
+ingress = _sanitize_rules(source_sg.get("IpPermissions", []))
+egress  = _sanitize_rules([
+    r for r in source_sg.get("IpPermissionsEgress", [])
+    if not _is_default_egress(r)
+])
+
+if dry_run:
+    print(f"      Ingress rules : {len(ingress)}")
+    print(f"      Egress rules  : {len(egress)}")
+    return None
+
+tags = [
+    {"Key": "dr-replica-of",  "Value": source_sg["GroupName"]},
+    {"Key": "source-account", "Value": source_sg["OwnerId"]},
+    *[t for t in source_sg.get("Tags", []) if t["Key"] != "Name"],
+]
+
+new_sg = ec2_client.create_security_group(
+    GroupName   = dr_name,
+    Description = f"[DR] {source_sg['Description']}",
+    VpcId       = dr_vpc_id,
+    TagSpecifications=[{"ResourceType": "security-group", "Tags": tags}],
+)
+sg_id = new_sg["GroupId"]
+
+if ingress:
+    ec2_client.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=ingress)
+    print(f"      ✅ {len(ingress)} ingress rule(s) added")
+
+if egress:
+    ec2_client.authorize_security_group_egress(GroupId=sg_id, IpPermissions=egress)
+    print(f"      ✅ {len(egress)} egress rule(s) added")
+
+return sg_id
+```
+
+def update_sg(ec2_client, dr_sg: dict, source_sg: dict, dry_run: bool):
+sg_id = dr_sg[“GroupId”]
+
+```
+missing_ingress = _missing_rules(
+    _sanitize_rules(source_sg.get("IpPermissions", [])),
+    dr_sg.get("IpPermissions", []),
+)
+missing_egress = _missing_rules(
+    _sanitize_rules([
+        r for r in source_sg.get("IpPermissionsEgress", [])
+        if not _is_default_egress(r)
+    ]),
+    dr_sg.get("IpPermissionsEgress", []),
+)
+
+if not missing_ingress and not missing_egress:
+    print("      ✅ Already in parity — nothing to do")
+    return
+
+if missing_ingress:
+    print(f"   🔧 {'Would add' if dry_run else 'Adding'} {len(missing_ingress)} missing ingress rule(s)")
+    if not dry_run:
+        ec2_client.authorize_security_group_ingress(
+            GroupId=sg_id, IpPermissions=missing_ingress
+        )
+
+if missing_egress:
+    print(f"   🔧 {'Would add' if dry_run else 'Adding'} {len(missing_egress)} missing egress rule(s)")
+    if not dry_run:
+        ec2_client.authorize_security_group_egress(
+            GroupId=sg_id, IpPermissions=missing_egress
+        )
+```
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+parser = argparse.ArgumentParser(description=“One-way SG parity sync: source → DR”)
+parser.add_argument(”–json”,       required=True, help=“Path to exported SG JSON file”)
+parser.add_argument(”–config”,     required=True, help=“Path to naming_rules.json”)
+parser.add_argument(”–dr-profile”, required=True, help=“AWS CLI profile for DR account”)
+parser.add_argument(”–dr-region”,  required=True, help=“DR account region”)
+parser.add_argument(”–dr-vpc”,     required=True, help=“DR VPC ID”)
+parser.add_argument(”–dry-run”,    action=“store_true”, help=“Simulate without changes”)
+args = parser.parse_args()
+
+```
+if args.dry_run:
+    print("🧪 DRY-RUN mode — no changes will be made\n")
+
+# Load inputs
+with open(args.json)   as f: export  = json.load(f)
+with open(args.config) as f: rules   = json.load(f)["rules"]
+
+source_sgs = export.get("SecurityGroups", [])
+if not source_sgs:
+    print("❌ No security groups found in export file.")
+    sys.exit(1)
+
+dr_session = boto3.Session(profile_name=args.dr_profile, region_name=args.dr_region)
+dr_ec2     = dr_session.client("ec2")
+
+print(f"📋 Processing {len(source_sgs)} security group(s)...\n")
+
+for sg in source_sgs:
+    source_name = sg["GroupName"]
+
+    try:
+        dr_name = derive_dr_name(source_name, rules)
+    except ValueError as e:
+        print(f"⚠️  SKIP [{source_name}]: {e}\n")
+        continue
+
+    print(f"🔍 [{source_name}]  →  [{dr_name}]")
+
+    try:
+        dr_sg = get_sg_by_name(dr_ec2, dr_name)
+
+        if dr_sg is None:
+            print("   ⚠️  DR replica not found — creating...")
+            create_sg(dr_ec2, sg, dr_name, args.dr_vpc, args.dry_run)
+        else:
+            print(f"   ✅ DR replica exists ({dr_sg['GroupId']}) — checking rule parity...")
+            update_sg(dr_ec2, dr_sg, sg, args.dry_run)
+
+    except ClientError as e:
+        print(f"   ❌ AWS error: {e}\n")
+        continue
+
+    print()
+
+print("🏁 Sync complete.")
+```
+
+if **name** == “**main**”:
+main()
