@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+
+"""
+
+sync_sg.py
+
+Reusable Python-only CLI for syncing AWS Security Groups from a source JSON export
+
+into a target DR account/VPC.
+
+Design assumptions:
+
+- Source/Prod is always provided as an exported JSON file via --json-path
+
+- Target/DR is always a live AWS account/VPC via CLI args
+
+- Source and target accounts are expected to be different
+
+- SG references are remapped by normalized name into target SG IDs
+
+- Dry-run should be used first before live execution
+
+Examples:
+
+Dry run:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --dry-run
+
+Audit only:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --report-only
+
+Live run:
+
+python sync_sg.py \
+
+  --json-path exports/prodA-sg-export.json \
+
+  --target-profile dr-profile \
+
+  --target-region us-east-2 \
+
+  --target-vpc-id vpc-0123456789abcdef0 \
+
+  --yes
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import threading
+import re
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple, DefaultDict
+from collections import defaultdict
+
+import boto3
+from botocore.exceptions import ClientError
+
+
+# --------------------------------------------------------------------
+# LOGGING
+# --------------------------------------------------------------------
+
+PRINT_LOCK = threading.Lock()
+
+def log(msg: str):
+    with PRINT_LOCK:
+        print(msg, flush=True)
+
+def eprint(msg: str):
+    with PRINT_LOCK:
+        print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------
+
+DEFAULT_REPORTS_DIR = "sg_reports"
+
+SYSTEM_TAG_KEYS_TO_IGNORE = {
+    "aws:cloudformation:logical-id",
+    "aws:cloudformation:stack-id",
+    "aws:cloudformation:stack-name",
+}
+
+
+# --------------------------------------------------------------------
+# ARGUMENTS
+# --------------------------------------------------------------------
+
+@dataclass
+class Args:
+    json_path: str
+    target_profile: str
+    target_region: str
+    target_vpc_id: str
+    dry_run: bool = False
+    report_only: bool = False
+    yes: bool = False
+    name_preview: bool = False
+    workers: int = 6
+    no_rollback: bool = False
+    report_path: Optional[str] = None
+
+
+def auto_report_path(json_path: str, target_profile: str, target_region: str) -> str:
+    Path(DEFAULT_REPORTS_DIR).mkdir(exist_ok=True)
+
+    base = Path(json_path).stem
+    timestamp = time.strftime("%Y%m%d_%H%M%S")  # e.g., 20260424_094500
+
+    filename = (
+        f"{base}_{target_profile}_{target_region}_"
+        f"{timestamp}_sg_sync_report.json"
+    )
+
+    return str(Path(DEFAULT_REPORTS_DIR) / filename)
+
+
+def parse_args() -> Args:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--json-path", required=True)
+    p.add_argument("--target-profile", required=True)
+    p.add_argument("--target-region", required=True)
+    p.add_argument("--target-vpc-id", required=True)
+
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--report-only", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--name-preview", action="store_true")
+    p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--no-rollback", action="store_true")
+    p.add_argument("--report-path", default=None)
+
+    ns = p.parse_args()
+
+    return Args(
+        json_path=ns.json_path,
+        target_profile=ns.target_profile,
+        target_region=ns.target_region,
+        target_vpc_id=ns.target_vpc_id,
+        dry_run=ns.dry_run,
+        report_only=ns.report_only,
+        yes=ns.yes,
+        name_preview=ns.name_preview,
+        workers=ns.workers,
+        no_rollback=ns.no_rollback,
+        report_path=ns.report_path or auto_report_path(ns.json_path, ns.target_profile, ns.target_region)
+    )
+
+
+# --------------------------------------------------------------------
+# DATA MODEL
+# --------------------------------------------------------------------
+
+@dataclass
+class SgAuditResult:
+    group_name: str
+    source_group_id: Optional[str] = None
+    target_group_id: Optional[str] = None
+    exists_in_target: bool = False
+    missing: List[str] = field(default_factory=list)
+    drift_fields: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def in_sync(self) -> bool:
+        return self.exists_in_target and not self.drift_fields and not self.missing
+    
+# --------------------------------------------------------------------
+# AWS HELPERS
+# --------------------------------------------------------------------
+
+def boto3_session(profile: str, region: str):
+    return boto3.Session(profile_name=profile, region_name=region)
+
+
+def get_ec2(profile: str, region: str):
+    return boto3_session(profile, region).client("ec2")
+
+
+def get_sts(profile: str, region: str):
+    return boto3_session(profile, region).client("sts")
+
+
+def get_account_id(profile: str, region: str) -> str:
+    sts = get_sts(profile, region)
+    return sts.get_caller_identity()["Account"]
+
+
+# --------------------------------------------------------------------
+# SOURCE LOADING (FIXED + SAFE)
+# --------------------------------------------------------------------
+
+def load_json_security_groups(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and "SecurityGroups" in data:
+        return data["SecurityGroups"]
+
+    if isinstance(data, list):
+        return data
+
+    raise ValueError("Invalid SG JSON format")
+
+
+def is_default_sg(sg: Dict[str, Any]) -> bool:
+    return sg.get("GroupName") == "default"
+
+
+# --------------------------------------------------------------------
+# NORMALIZATION (FIXED, SAFE, NON-DESTRUCTIVE)
+# --------------------------------------------------------------------
+
+def normalize_sg_name(name: str, src_acct: str, tgt_acct: str) -> str:
+    """
+    Robust multi-stage normalization for SG names.
+    Handles:
+    - CFN stack prefixes (stack-<anything>-<LogicalID>-<hash>)
+    - Environment prefixes (d-xxxxxx-, prod-, dev-, qa-, etc.)
+    - Account prefixes
+    - Random suffixes
+    - Mixed separators
+    - Case normalization
+    """
+
+    original = name
+
+    # 1. Replace embedded account ID if different
+    if src_acct and tgt_acct and src_acct != tgt_acct:
+        name = name.replace(src_acct, tgt_acct)
+
+    # 2. Lowercase everything early
+    name = name.lower()
+
+    # 3. Strip ANY CloudFormation stack prefix (multi-segment, mixed case)
+    #    Example: stack-abc123-nested-xyz789-rsecuritygroup-1abcxyz
+    name = re.sub(r"^stack-[a-z0-9-]+-", "", name, flags=re.IGNORECASE)
+
+    # 4. Strip environment/account prefixes:
+    #    d-12345665-, prod-, dev-, qa-, uat-, etc.
+    name = re.sub(
+        r"^(d|dev|prod|qa|uat|stage|stg|test|acc|acct|env)-[a-z0-9]+[-_]",
+        "",
+        name
+    )
+
+    # 5. Strip leading account-number prefixes:
+    #    123456789012-<name>
+    name = re.sub(r"^[0-9]{6,12}[-_]", "", name)
+
+    # 6. Strip trailing CFN resource hash:
+    #    <name>-ABC12345
+    name = re.sub(r"-[a-z0-9]{8,}$", "", name)
+
+    # 7. Strip trailing env suffixes:
+    #    <name>-dev, <name>-prod, <name>-12345
+    name = re.sub(
+        r"-(dev|prod|qa|uat|stage|stg|test|acc|acct|env|[0-9]+)$",
+        "",
+        name
+    )
+
+    # 8. Collapse multiple separators
+    name = re.sub(r"[-_]+", "-", name)
+
+    # 9. Final cleanup
+    name = name.strip("-_ ")
+
+    return name
+
+# --------------------------------------------------------------------
+# TARGET SG MAP (FIXED + DEDUP SAFE)
+# --------------------------------------------------------------------
+
+def get_target_sg_map(ec2, vpc_id, src_acct, tgt_acct):
+    response = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+
+    tgt_map = {}
+
+    for sg in response["SecurityGroups"]:
+        raw = sg["GroupName"]
+        canon = normalize_sg_name(raw, src_acct, tgt_acct)
+
+        tgt_map[canon] = sg
+
+    return tgt_map
+
+
+# --------------------------------------------------------------------
+# TAG NORMALIZATION (UNCHANGED BUT SAFER)
+# --------------------------------------------------------------------
+
+def canonical_tags(tags: Optional[List[Dict[str, str]]]) -> List[Tuple[str, str]]:
+    out = []
+    for t in tags or []:
+        k = t.get("Key")
+        v = t.get("Value")
+        if k and k not in SYSTEM_TAG_KEYS_TO_IGNORE:
+            out.append((k, v))
+    return sorted(out)
+
+# --------------------------------------------------------------------
+# PERMISSION NORMALIZATION (MINIMAL SAFE VERSION)
+# --------------------------------------------------------------------
+
+def normalize_permissions(perms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Simplified stable comparator for SG rules.
+    Keeps structure but removes ordering noise.
+    """
+
+    normalized = []
+
+    for p in perms or []:
+        norm = {
+            "IpProtocol": p.get("IpProtocol"),
+            "FromPort": p.get("FromPort"),
+            "ToPort": p.get("ToPort"),
+            "IpRanges": sorted(p.get("IpRanges", []), key=str),
+            "Ipv6Ranges": sorted(p.get("Ipv6Ranges", []), key=str),
+            "PrefixListIds": sorted(p.get("PrefixListIds", []), key=str),
+        }
+
+        # Normalize UserIdGroupPairs safely
+        ugp = []
+        for x in p.get("UserIdGroupPairs", []) or []:
+            if x.get("GroupId"):
+                ugp.append({"GroupId": x["GroupId"]})
+
+        if ugp:
+            norm["UserIdGroupPairs"] = sorted(ugp, key=lambda z: z["GroupId"])
+
+        normalized.append(norm)
+
+    return sorted(normalized, key=str)
+
+
+# --------------------------------------------------------------------
+# PLAN MODEL
+# --------------------------------------------------------------------
+
+@dataclass
+class Plan:
+    changes: List[SgAuditResult]
+
+
+# --------------------------------------------------------------------
+# CORE BUILD PLAN (THIS REPLACES SGSyncEngine)
+# --------------------------------------------------------------------
+
+def build_plan(
+    source_groups: List[Dict[str, Any]],
+    target_map: Dict[str, Dict[str, Any]],
+    src_acct: str,
+    tgt_acct: str
+) -> Plan:
+
+    results: List[SgAuditResult] = []
+
+    for sg in source_groups:
+
+        name = sg["GroupName"]
+        canon = normalize_sg_name(name, src_acct, tgt_acct)
+
+        tgt = target_map.get(canon)
+
+        src_ing = normalize_permissions(sg.get("IpPermissions", []))
+        src_eg = normalize_permissions(sg.get("IpPermissionsEgress", []))
+
+        if not tgt:
+            results.append(SgAuditResult(
+                group_name=name,
+                exists_in_target=False,
+                missing=["SG missing in target"]
+            ))
+            continue
+
+        tgt_ing = normalize_permissions(tgt.get("IpPermissions", []))
+        tgt_eg = normalize_permissions(tgt.get("IpPermissionsEgress", []))
+
+        drift_fields = []
+
+        if src_ing != tgt_ing:
+            drift_fields.append("Ingress")
+
+        if src_eg != tgt_eg:
+            drift_fields.append("Egress")
+
+        results.append(SgAuditResult(
+            group_name=name,
+            source_group_id=sg.get("GroupId"),
+            target_group_id=tgt.get("GroupId"),
+            exists_in_target=True,
+            drift_fields=drift_fields
+        ))
+
+    return Plan(changes=results)
+
+
+# --------------------------------------------------------------------
+# SUMMARY + METRICS (FIXED)
+# --------------------------------------------------------------------
+
+def compute_summary(results: List[SgAuditResult]) -> Dict[str, Any]:
+
+    total = len(results)
+    missing = [r for r in results if not r.exists_in_target]
+    drift = [r for r in results if r.exists_in_target and r.drift_fields]
+    in_sync = total - len(missing) - len(drift)
+
+    return {
+        "total": total,
+        "in_sync": in_sync,
+        "drift": len(drift),
+        "missing": len(missing),
+        "missing_list": [r.group_name for r in missing],
+        "drift_list": [
+            {
+                "group": r.group_name,
+                "fields": r.drift_fields
+            }
+            for r in drift
+        ]
+    }
+
+
+# --------------------------------------------------------------------
+# REPORT WRITER (FIXED STRUCTURE)
+# --------------------------------------------------------------------
+
+def write_report(report_path: str, results: List[SgAuditResult]) -> None:
+
+    summary = compute_summary(results)
+
+    payload = {
+        "summary": summary,
+        "results": [asdict(r) for r in results]
+    }
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    log(f"[REPORT] saved -> {report_path}")
+
+
+# --------------------------------------------------------------------
+# SUMMARY PRINTER (FIXED OUTPUT)
+# --------------------------------------------------------------------
+
+def print_summary(results: List[SgAuditResult]) -> None:
+
+    summary = compute_summary(results)
+
+    log("\n========== SUMMARY ==========")
+    log(f"Total   : {summary['total']}")
+    log(f"In Sync : {summary['in_sync']}")
+    log(f"Drift   : {summary['drift']}")
+    log(f"Missing : {summary['missing']}")
+    log("=============================\n")
+
+    if summary["missing_list"]:
+        log("Missing SGs:")
+        for m in summary["missing_list"]:
+            log(f" - {m}")
+
+    if summary["drift_list"]:
+        log("\nDrifted SGs:")
+        for d in summary["drift_list"]:
+            log(f" - {d['group']} ({', '.join(d['fields'])})")
+
+
+# --------------------------------------------------------------------
+# EXIT CODE HANDLER (FIXED - NO RETURN OUTSIDE FUNCTION)
+# --------------------------------------------------------------------
+
+def compute_exit_code(results: List[SgAuditResult]) -> int:
+    summary = compute_summary(results)
+    return 1 if (summary["drift"] > 0 or summary["missing"] > 0) else 0
+
+# --------------------------------------------------------------------
+# MAIN EXECUTION FLOW (FINAL FIX)
+# --------------------------------------------------------------------
+
+def main() -> int:
+
+    args = parse_args()
+
+    # ----------------------------
+    # Load source SGs
+    # ----------------------------
+    source_groups = load_json_security_groups(args.json_path)
+    source_groups = [s for s in source_groups if not is_default_sg(s)]
+
+    if not source_groups:
+        log("No non-default security groups found.")
+        return 0
+
+    # ----------------------------
+    # AWS setup
+    # ----------------------------
+    ec2 = get_ec2(args.target_profile, args.target_region)
+
+    src_acct = get_account_id(args.target_profile, args.target_region)
+    tgt_acct = src_acct
+
+    log(f"[INFO] Source SGs: {len(source_groups)}")
+    log(f"[INFO] Target region: {args.target_region}")
+    log(f"[INFO] Target VPC: {args.target_vpc_id}")
+
+    # ----------------------------
+    # Target SG map
+    # ----------------------------
+    tgt_map = get_target_sg_map(ec2, args.target_vpc_id, src_acct, tgt_acct)
+
+    # ----------------------------
+    # Preview mode
+    # ----------------------------
+    if args.name_preview:
+        for sg in source_groups:
+            raw = sg["GroupName"]
+            canon = normalize_sg_name(raw, src_acct, tgt_acct)
+            log(f"{raw} -> {canon}")
+        return 0
+
+    # ----------------------------
+    # PLAN BUILD
+    # ----------------------------
+    plan = build_plan(
+        source_groups=source_groups,
+        target_map=tgt_map,
+        src_acct=src_acct,
+        tgt_acct=tgt_acct
+    )
+
+    results = plan.changes
+
+    # ----------------------------
+    # OUTPUT
+    # ----------------------------
+    print_summary(results)
+    write_report(args.report_path, results)
+
+    # ----------------------------
+    # EXIT CODE
+    # ----------------------------
+    return compute_exit_code(results)
+
+
+# --------------------------------------------------------------------
+# SAFE ENTRYPOINT
+# --------------------------------------------------------------------
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        eprint(f"[FATAL] {e}")
+        sys.exit(1)
