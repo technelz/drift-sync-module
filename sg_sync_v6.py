@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-sync_sg_v5_patched.py
+sg_sync_v6.py
 
 AWS Security Group DR parity sync tool.
 
 Purpose:
 - Read source/Prod security groups from an exported JSON file.
 - Read target/DR security groups live from AWS.
-- Build a safe matching plan using:
+- Build a safe matching plan using enterprise-safe strategies:
   1. Manual name-map override
   2. Exact GroupName match
-  3. CloudFormation tag-based match
-  4. Normalized name match
+  3. Case-insensitive GroupName match
+  4. Exact Name-tag match
+  5. Case-insensitive Name-tag match
+  6. CloudFormation stack-name + logical-id match
+  7. CloudFormation logical-id-only match
+  8. Normalized GroupName / Name-tag cross-match
 - Preserve original source names, actual target names, normalized match keys, and match confidence in the report.
 - Block unsafe --yes remediation by default when matching is ambiguous or low confidence.
 - Create missing target SGs.
@@ -23,7 +27,11 @@ Important:
 - Default SG is skipped.
 - AWS-managed CloudFormation tags are used for matching clues but are not copied to target resources.
 - Security group descriptions cannot be updated in-place by AWS. Exact description parity for existing SGs requires recreation.
-- Use --dry-run first.
+- Use --dry-run or --name-preview first.
+
+Enterprise note:
+- In many enterprise AWS accounts, the value humans see in the console may be the Name tag, not the actual GroupName.
+  This version treats both GroupName and the Name tag as first-class matching identifiers.
 """
 
 from __future__ import annotations
@@ -66,6 +74,7 @@ SYSTEM_TAG_KEYS_TO_IGNORE = {
 
 CFN_LOGICAL_ID_KEY = "aws:cloudformation:logical-id"
 CFN_STACK_NAME_KEY = "aws:cloudformation:stack-name"
+NAME_TAG_KEY = "Name"
 
 GENERIC_LOW_CONFIDENCE_KEYS = {
     "securitygroup",
@@ -75,6 +84,9 @@ GENERIC_LOW_CONFIDENCE_KEYS = {
     "websg",
     "appsg",
     "dbsg",
+    "web-security-group",
+    "app-security-group",
+    "db-security-group",
 }
 
 
@@ -85,10 +97,12 @@ class Args:
     target_region: str
     target_vpc_id: str
     source_account_id: Optional[str] = None
+    target_account_id: Optional[str] = None
     dry_run: bool = False
     report_only: bool = False
     yes: bool = False
     name_preview: bool = False
+    debug_names: bool = False
     workers: int = 6
     no_rollback: bool = False
     report_path: Optional[str] = None
@@ -115,6 +129,11 @@ def parse_args() -> Args:
         default=None,
         help="Optional source/Prod AWS account ID used for embedded account-ID name normalization.",
     )
+    p.add_argument(
+        "--target-account-id",
+        default=None,
+        help="Optional target/DR AWS account ID. If omitted, STS caller identity is used.",
+    )
     p.add_argument("--target-profile", required=True)
     p.add_argument("--target-region", required=True)
     p.add_argument("--target-vpc-id", required=True)
@@ -122,6 +141,7 @@ def parse_args() -> Args:
     p.add_argument("--report-only", action="store_true", help="Audit only. Do not modify DR.")
     p.add_argument("--yes", action="store_true", help="Apply remediation to DR.")
     p.add_argument("--name-preview", action="store_true", help="Show matching details and exit.")
+    p.add_argument("--debug-names", action="store_true", help="Print source/target GroupName, Name tag, normalized keys, and CFN keys.")
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--no-rollback", action="store_true")
     p.add_argument("--report-path", default=None)
@@ -142,6 +162,7 @@ def parse_args() -> Args:
     return Args(
         json_path=ns.json_path,
         source_account_id=ns.source_account_id,
+        target_account_id=ns.target_account_id,
         target_profile=ns.target_profile,
         target_region=ns.target_region,
         target_vpc_id=ns.target_vpc_id,
@@ -149,6 +170,7 @@ def parse_args() -> Args:
         report_only=ns.report_only,
         yes=ns.yes,
         name_preview=ns.name_preview,
+        debug_names=ns.debug_names,
         workers=ns.workers,
         no_rollback=ns.no_rollback,
         report_path=ns.report_path or auto_report_path(ns.json_path, ns.target_profile, ns.target_region),
@@ -166,12 +188,16 @@ class MatchInfo:
     source_group_name: str
     source_group_id: Optional[str]
     normalized_match_key: str
+    source_name_tag: Optional[str] = None
     target_group_name: Optional[str] = None
     target_group_id: Optional[str] = None
+    target_name_tag: Optional[str] = None
     match_method: str = "unmatched"
     match_confidence: str = "unmatched"
     ambiguous: bool = False
     ambiguity_reason: Optional[str] = None
+    matched_key_type: Optional[str] = None
+    matched_key_value: Optional[str] = None
 
 
 @dataclass
@@ -179,11 +205,15 @@ class SgAuditResult:
     source_group_name: str
     normalized_match_key: str
     source_group_id: Optional[str] = None
+    source_name_tag: Optional[str] = None
     target_group_name: Optional[str] = None
     target_group_id: Optional[str] = None
+    target_name_tag: Optional[str] = None
     exists_in_target: bool = False
     match_method: str = "unmatched"
     match_confidence: str = "unmatched"
+    matched_key_type: Optional[str] = None
+    matched_key_value: Optional[str] = None
     ambiguous: bool = False
     ambiguity_reason: Optional[str] = None
     missing: List[str] = field(default_factory=list)
@@ -269,6 +299,10 @@ def tag_value(sg: Dict[str, Any], key: str) -> Optional[str]:
     return None
 
 
+def name_tag(sg: Dict[str, Any]) -> Optional[str]:
+    return tag_value(sg, NAME_TAG_KEY)
+
+
 def canonical_tags(tags: Optional[List[Dict[str, str]]]) -> List[Tuple[str, str]]:
     out = []
     for t in tags or []:
@@ -299,269 +333,183 @@ def cfn_match_key(sg: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _looks_generated_token(token: str) -> bool:
-    """
-    Return True when a trailing token looks like a generated CloudFormation/CDK/Terraform
-    suffix rather than a meaningful application word.
-
-    Examples treated as generated:
-    - 1abc2345
-    - a1b2c3d4
-    - 1rsc3wy00p7ht
-
-    Examples treated as meaningful:
-    - datasync
-    - ec2servers
-    - https
-    - web80
-    """
-    t = (token or "").lower().strip("-_ ")
-    if not t:
-        return False
-
-    if re.fullmatch(r"[a-f0-9]{8,}", t):
-        return True
-
-    # Generated suffixes usually contain both letters and digits and are long.
-    if len(t) >= 8 and re.search(r"[a-z]", t) and re.search(r"\d", t):
-        # Avoid stripping meaningful words with common infrastructure nouns.
-        meaningful = ("server", "servers", "datasync", "http", "https", "tcp", "udp", "icmp", "ec2", "rds", "alb", "nlb")
-        if any(word in t for word in meaningful):
-            return False
-        return True
-
-    return False
+def cfn_logical_key(sg: Dict[str, Any]) -> Optional[str]:
+    logical_id = tag_value(sg, CFN_LOGICAL_ID_KEY)
+    if logical_id:
+        return logical_id.lower().strip()
+    return None
 
 
-def _strip_generated_suffix(name: str) -> str:
-    """
-    Strip one or more generated trailing suffix tokens while preserving meaningful names.
-    """
-    n = name or ""
-    for _ in range(3):
-        parts = re.split(r"[-_]", n)
-        if len(parts) <= 1:
-            return n
-        last = parts[-1]
-        if _looks_generated_token(last):
-            n = re.sub(r"[-_]" + re.escape(last) + r"$", "", n)
-            continue
-        break
-    return n
-
-
-def _cleanup_name_key(name: str) -> str:
-    n = (name or "").lower().strip()
-    n = n.replace("\\", "-").replace("/", "-").replace(".", "-").replace(" ", "-")
-    n = re.sub(r"-{2,}", "-", n)
-    n = re.sub(r"_{2,}", "_", n)
-    return n.strip("-_ ")
-
-
-def _strip_account_ids(name: str, src_acct: str = "", tgt_acct: str = "") -> str:
-    n = name or ""
+def _drop_account_ids(value: str, src_acct: str = "", tgt_acct: str = "") -> str:
+    out = value
     for acct in {str(src_acct or ""), str(tgt_acct or "")}:
         if acct:
-            n = n.replace(acct, "")
-    # Also remove standalone 12-digit account IDs.
-    n = re.sub(r"(?<!\d)\d{12}(?!\d)", "", n)
-    return n
-
-
-def _strip_env_tokens(name: str) -> str:
-    """
-    Remove environment tokens when they are standalone prefix/suffix/middle tokens.
-    This allows prod/dr counterparts to match without removing words like product.
-    """
-    env_tokens = {
-        "prod", "production", "prd",
-        "dr", "dre", "disasterrecovery",
-        "dev", "development",
-        "qa", "uat", "test", "stage", "stg",
-        "acc", "acct", "env",
-    }
-    tokens = re.split(r"([-_])", name or "")
-    rebuilt = []
-    for token in tokens:
-        if token in {"-", "_"}:
-            rebuilt.append(token)
-            continue
-        if token.lower() in env_tokens:
-            continue
-        rebuilt.append(token)
-    n = "".join(rebuilt)
-    n = re.sub(r"[-_]{2,}", "-", n)
-    return n.strip("-_ ")
-
-
-def _strip_known_prefix_noise(name: str) -> str:
-    n = name or ""
-
-    # d-afshcjcjv-sg-name, dr-afshcjcjv-sg-name -> sg-name
-    n = re.sub(
-        r"^(d|dr|dev|prod|prd|qa|uat|stage|stg|test|acc|acct|env)-[a-z0-9]{4,}[-_]",
-        "",
-        n,
-        flags=re.IGNORECASE,
-    )
-
-    # 123456789012-sg-name -> sg-name
-    n = re.sub(r"^[0-9]{6,12}[-_]", "", n, flags=re.IGNORECASE)
-
-    # sg-0123abcd embedded in names should not participate in name matching.
-    n = re.sub(r"sg-[a-f0-9]{8,17}", "", n, flags=re.IGNORECASE)
-
-    return _cleanup_name_key(n)
-
-
-def _cloudformation_name_variants(name: str) -> List[str]:
-    """
-    Build safe variants for common CloudFormation/CDK-generated names.
-
-    Important:
-    We do NOT reduce everything to only 'securitygroup' because that creates false positives.
-    We keep the logical-resource portion and also provide suffix-chain fallbacks.
-    """
-    n = _cleanup_name_key(name)
-    variants: List[str] = []
-
-    # Remove generated suffix first, then reason about stack-ish prefix.
-    without_suffix = _strip_generated_suffix(n)
-    if without_suffix and without_suffix != n:
-        variants.append(without_suffix)
-
-    c = without_suffix or n
-
-    # stack-myapp-prod-websecuritygroup -> myapp-prod-websecuritygroup and websecuritygroup
-    if c.startswith("stack-"):
-        rest = re.sub(r"^stack-", "", c)
-        if rest:
-            variants.append(rest)
-
-            # Add suffix-chain variants, preserving specificity.
-            parts = rest.split("-")
-            for i in range(1, len(parts)):
-                candidate = "-".join(parts[i:])
-                if re.search(r"(securitygroup|security-group|sg)", candidate, flags=re.IGNORECASE):
-                    variants.append(candidate)
-
-    # AWS/CDK often embeds the logical ID close to the end.
-    # Example: app-prod-websecuritygroup -> websecuritygroup
-    parts = c.split("-")
-    for i in range(len(parts)):
-        candidate = "-".join(parts[i:])
-        if candidate != c and re.search(r"(securitygroup|security-group|sg)", candidate, flags=re.IGNORECASE):
-            variants.append(candidate)
-
-    return variants
-
-
-def normalized_sg_keys(name: str, src_acct: str = "", tgt_acct: str = "") -> List[str]:
-    """
-    Return multiple safe match keys for one SG name.
-
-    Why this exists:
-    A single normalized key is too brittle in enterprise/CloudFormation environments.
-    Source and DR can differ by stack prefix, environment token, account ID, and generated
-    suffix. We index and match against several deterministic keys while still blocking
-    ambiguous matches.
-
-    The first key is the primary reporting key. Later keys are fallback keys.
-    """
-    raw = _cleanup_name_key(_strip_account_ids(name or "", src_acct, tgt_acct))
-    raw = _strip_known_prefix_noise(raw)
-
-    candidates = [
-        raw,
-        _strip_generated_suffix(raw),
-        _strip_env_tokens(raw),
-        _strip_env_tokens(_strip_generated_suffix(raw)),
-    ]
-
-    for v in _cloudformation_name_variants(raw):
-        candidates.append(v)
-        candidates.append(_strip_env_tokens(v))
-        candidates.append(_strip_generated_suffix(v))
-        candidates.append(_strip_env_tokens(_strip_generated_suffix(v)))
-
-    # Separator-insensitive fallback, useful when one side uses _ and the other uses -.
-    expanded = []
-    for c in candidates:
-        c = _cleanup_name_key(c)
-        if not c:
-            continue
-        expanded.append(c)
-        expanded.append(c.replace("_", "-"))
-        expanded.append(c.replace("-", "_"))
-
-    # De-duplicate while preserving order and avoid very broad keys unless no better key exists.
-    seen = set()
-    out = []
-    for c in expanded:
-        c = _cleanup_name_key(c)
-        if not c or c in seen:
-            continue
-        seen.add(c)
-        out.append(c)
-
-    # Prefer more specific keys first, but keep original key first for report readability.
-    if out:
-        primary = out[0]
-        rest = sorted(out[1:], key=lambda x: (-len(x), x))
-        out = [primary] + rest
-
+            out = out.replace(acct, "")
     return out
 
 
-def normalize_sg_name(name: str, src_acct: str = "", tgt_acct: str = "") -> str:
+def normalize_sg_name(name: Optional[str], src_acct: str = "", tgt_acct: str = "") -> str:
     """
-    Primary normalized name used for reporting. Matching uses normalized_sg_keys().
+    Enterprise SG-name normalization.
+
+    Goals:
+    - Match names where Prod and DR use different env/account prefixes.
+    - Match CloudFormation-generated name suffix variants.
+    - Keep meaningful application terms intact.
+    - Avoid collapsing names so aggressively that unrelated SGs match.
     """
-    keys = normalized_sg_keys(name, src_acct, tgt_acct)
-    return keys[0] if keys else ""
+    if not name:
+        return ""
+
+    normalized = str(name).strip().lower()
+    normalized = _drop_account_ids(normalized, src_acct, tgt_acct)
+    normalized = normalized.replace("_", "-")
+
+    # Remove common AWS/CFN generated security-group ID tokens if embedded.
+    normalized = re.sub(r"sg-[a-f0-9]{8,17}", "", normalized)
+
+    # CloudFormation pattern: stack-name-logicalid-randomhash -> logicalid or meaningful suffix.
+    cfn_match = re.match(
+        r"^stack-[a-z0-9][a-z0-9-]*-([a-z0-9-]*(?:securitygroup|security-group|sg)[a-z0-9-]*)-(?:[a-f0-9]{8,}|(?=[a-z0-9]*\d)[a-z0-9]{8,})$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if cfn_match:
+        normalized = cfn_match.group(1)
+    else:
+        maybe = re.sub(r"^stack-[a-z0-9][a-z0-9-]*-", "", normalized, flags=re.IGNORECASE)
+        if maybe != normalized and re.search(r"(securitygroup|security-group|sg)", maybe, flags=re.IGNORECASE):
+            normalized = maybe
+
+    # Remove environment prefixes.
+    normalized = re.sub(
+        r"^(prod|production|prd|dr|dev|development|qa|uat|stage|stg|test|acc|acct|env)[-_]+",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove env + random/generated prefix: dr-a1b2c3d4-sg-name -> sg-name.
+    normalized = re.sub(
+        r"^(d|dr|dev|prod|prd|qa|uat|stage|stg|test|acc|acct|env)-[a-z0-9]{4,}[-_]",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove leading account-number prefix.
+    normalized = re.sub(r"^[0-9]{6,12}[-_]", "", normalized, flags=re.IGNORECASE)
+
+    # Remove trailing generated suffix only when it looks hash/random-like.
+    normalized = re.sub(
+        r"-(?:[a-f0-9]{8,}|(?=[a-z0-9]*\d)[a-z0-9]{8,})$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalize common SG wording variants.
+    normalized = normalized.replace("security-group", "securitygroup")
+    normalized = normalized.replace("securitygroups", "securitygroup")
+
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    normalized = normalized.strip("-_ ")
+    return normalized
+
+
+def compact_name_key(name: Optional[str], src_acct: str = "", tgt_acct: str = "") -> str:
+    """More permissive key used only as a fallback index. Removes separators."""
+    n = normalize_sg_name(name, src_acct, tgt_acct)
+    return re.sub(r"[^a-z0-9]", "", n)
 
 
 def is_low_confidence_key(key: str) -> bool:
     k = (key or "").lower().strip()
-    if not k or k in GENERIC_LOW_CONFIDENCE_KEYS or len(k) < 5:
+    compact = re.sub(r"[^a-z0-9]", "", k)
+    if not compact or k in GENERIC_LOW_CONFIDENCE_KEYS or compact in GENERIC_LOW_CONFIDENCE_KEYS or len(compact) < 5:
         return True
     if re.fullmatch(r"r?securitygroup[0-9a-z-]*", k):
+        return True
+    if re.fullmatch(r"r?securitygroup[0-9a-z]*", compact):
         return True
     return False
 
 
+def identity_values_for_sg(sg: Dict[str, Any], src_acct: str, tgt_acct: str) -> Dict[str, List[str]]:
+    """
+    Return all useful identity values for matching.
+    This is intentionally explicit so name-preview/debug output can explain what matched.
+    """
+    values: Dict[str, List[str]] = defaultdict(list)
+    group_name = sg.get("GroupName", "") or ""
+    nt = name_tag(sg) or ""
+
+    if group_name:
+        values["group_name_exact"].append(group_name)
+        values["group_name_lower"].append(group_name.lower())
+        values["group_name_normalized"].append(normalize_sg_name(group_name, src_acct, tgt_acct))
+        values["group_name_compact"].append(compact_name_key(group_name, src_acct, tgt_acct))
+
+    if nt:
+        values["name_tag_exact"].append(nt)
+        values["name_tag_lower"].append(nt.lower())
+        values["name_tag_normalized"].append(normalize_sg_name(nt, src_acct, tgt_acct))
+        values["name_tag_compact"].append(compact_name_key(nt, src_acct, tgt_acct))
+
+    ck = cfn_match_key(sg)
+    if ck:
+        values["cfn_stack_logical"].append(ck)
+
+    lk = cfn_logical_key(sg)
+    if lk:
+        values["cfn_logical_only"].append(lk)
+
+    # Deduplicate and remove empty strings.
+    return {k: sorted(set(v for v in vals if v)) for k, vals in values.items()}
+
+
 def get_target_sgs(ec2, vpc_id: str) -> List[Dict[str, Any]]:
-    """
-    Return all target SGs in the DR VPC using a paginator.
-    This avoids partial discovery in large enterprise VPCs.
-    """
+    """Return all target SGs in the DR VPC using a paginator."""
     paginator = ec2.get_paginator("describe_security_groups")
     out: List[Dict[str, Any]] = []
 
-    for page in paginator.paginate(
-        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-    ):
+    for page in paginator.paginate(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]):
         out.extend(page.get("SecurityGroups", []))
 
     return out
 
+
 def index_target_sgs(target_sgs: List[Dict[str, Any]], src_acct: str, tgt_acct: str) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-    indexes = {
-        "by_exact_name": defaultdict(list),
-        "by_normalized": defaultdict(list),
-        "by_cfn": defaultdict(list),
-    }
+    index_names = [
+        "group_name_exact",
+        "group_name_lower",
+        "name_tag_exact",
+        "name_tag_lower",
+        "cfn_stack_logical",
+        "cfn_logical_only",
+        "group_name_normalized",
+        "name_tag_normalized",
+        "group_name_compact",
+        "name_tag_compact",
+    ]
+    indexes: Dict[str, Dict[str, List[Dict[str, Any]]]] = {name: defaultdict(list) for name in index_names}
+
+    # Cross indexes let source GroupName match target Name tag and source Name tag match target GroupName.
+    indexes["any_normalized"] = defaultdict(list)
+    indexes["any_compact"] = defaultdict(list)
 
     for sg in target_sgs:
-        name = sg.get("GroupName", "")
-        indexes["by_exact_name"][name].append(sg)
+        vals = identity_values_for_sg(sg, src_acct, tgt_acct)
+        for idx_name, idx_values in vals.items():
+            if idx_name in indexes:
+                for value in idx_values:
+                    indexes[idx_name][value].append(sg)
 
-        for key in normalized_sg_keys(name, src_acct, tgt_acct):
-            indexes["by_normalized"][key].append(sg)
+        for value in vals.get("group_name_normalized", []) + vals.get("name_tag_normalized", []):
+            indexes["any_normalized"][value].append(sg)
 
-        cfn_key = cfn_match_key(sg)
-        if cfn_key:
-            indexes["by_cfn"][cfn_key].append(sg)
+        for value in vals.get("group_name_compact", []) + vals.get("name_tag_compact", []):
+            indexes["any_compact"][value].append(sg)
 
     return indexes
 
@@ -569,135 +517,127 @@ def index_target_sgs(target_sgs: List[Dict[str, Any]], src_acct: str, tgt_acct: 
 def get_single_match(candidates: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
     if not candidates:
         return None, False, None
-    unique = {sg.get("GroupId"): sg for sg in candidates}
+    unique = {sg.get("GroupId"): sg for sg in candidates if sg.get("GroupId")}
     if len(unique) == 1:
         return next(iter(unique.values())), False, None
-    names = [f"{sg.get('GroupName')} ({sg.get('GroupId')})" for sg in unique.values()]
+    names = [f"{sg.get('GroupName')} / NameTag={name_tag(sg) or ''} ({sg.get('GroupId')})" for sg in unique.values()]
     return None, True, "Multiple target SGs matched: " + ", ".join(sorted(names))
 
 
-def match_source_to_target(source_sg: Dict[str, Any], indexes, name_map: Dict[str, str], src_acct: str, tgt_acct: str) -> MatchInfo:
-    source_name = source_sg.get("GroupName", "")
-    source_id = source_sg.get("GroupId")
-    source_keys = normalized_sg_keys(source_name, src_acct, tgt_acct)
-    normalized_key = source_keys[0] if source_keys else ""
+def _make_match(
+    source_sg: Dict[str, Any],
+    target: Optional[Dict[str, Any]],
+    normalized_key: str,
+    method: str,
+    confidence: str,
+    key_type: Optional[str] = None,
+    key_value: Optional[str] = None,
+    ambiguous: bool = False,
+    reason: Optional[str] = None,
+) -> MatchInfo:
+    return MatchInfo(
+        source_group_name=source_sg.get("GroupName", ""),
+        source_group_id=source_sg.get("GroupId"),
+        normalized_match_key=normalized_key,
+        source_name_tag=name_tag(source_sg),
+        target_group_name=target.get("GroupName") if target else None,
+        target_group_id=target.get("GroupId") if target else None,
+        target_name_tag=name_tag(target) if target else None,
+        match_method=method,
+        match_confidence=confidence,
+        ambiguous=ambiguous,
+        ambiguity_reason=reason,
+        matched_key_type=key_type,
+        matched_key_value=key_value,
+    )
 
-    # 1. Manual map is always highest priority.
+
+def match_source_to_target(
+    source_sg: Dict[str, Any],
+    indexes: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    name_map: Dict[str, str],
+    src_acct: str,
+    tgt_acct: str,
+) -> MatchInfo:
+    source_name = source_sg.get("GroupName", "")
+    source_name_tag = name_tag(source_sg) or ""
+    normalized_key = normalize_sg_name(source_name, src_acct, tgt_acct)
+    source_vals = identity_values_for_sg(source_sg, src_acct, tgt_acct)
+
+    # 1. Manual override. Match target GroupName or Name tag exactly/case-insensitively.
     if source_name in name_map:
         target_name = name_map[source_name]
-        target, ambiguous, reason = get_single_match(indexes["by_exact_name"].get(target_name, []))
+        manual_candidates = []
+        manual_candidates.extend(indexes["group_name_exact"].get(target_name, []))
+        manual_candidates.extend(indexes["name_tag_exact"].get(target_name, []))
+        manual_candidates.extend(indexes["group_name_lower"].get(target_name.lower(), []))
+        manual_candidates.extend(indexes["name_tag_lower"].get(target_name.lower(), []))
+        target, ambiguous, reason = get_single_match(manual_candidates)
         if target:
-            return MatchInfo(
-                source_name,
-                source_id,
-                normalized_key,
-                target.get("GroupName"),
-                target.get("GroupId"),
-                "manual-name-map",
-                "manual",
-            )
-        return MatchInfo(
-            source_name,
-            source_id,
+            return _make_match(source_sg, target, normalized_key, "manual-name-map", "manual", "manual", target_name)
+        return _make_match(
+            source_sg,
+            None,
             normalized_key,
-            match_method="manual-name-map",
-            match_confidence="unmatched",
+            "manual-name-map",
+            "unmatched",
+            "manual",
+            target_name,
             ambiguous=ambiguous,
-            ambiguity_reason=reason or f"Manual name-map target not found: {target_name}",
+            reason=reason or f"Manual name-map target not found: {target_name}",
         )
 
-    # 2. Exact name match.
-    target, ambiguous, reason = get_single_match(indexes["by_exact_name"].get(source_name, []))
-    if target:
-        return MatchInfo(
-            source_name,
-            source_id,
-            normalized_key,
-            target.get("GroupName"),
-            target.get("GroupId"),
-            "exact-name",
-            "exact",
-        )
-    if ambiguous:
-        return MatchInfo(
-            source_name,
-            source_id,
-            normalized_key,
-            match_method="exact-name",
-            match_confidence="ambiguous",
-            ambiguous=True,
-            ambiguity_reason=reason,
-        )
+    # Strict high-confidence strategies first.
+    strict_strategy_order = [
+        ("group_name_exact", "exact-group-name", "exact"),
+        ("group_name_lower", "case-insensitive-group-name", "exact-ci"),
+        ("name_tag_exact", "exact-name-tag", "name-tag"),
+        ("name_tag_lower", "case-insensitive-name-tag", "name-tag-ci"),
+        ("cfn_stack_logical", "cloudformation-stack-logical", "tag-based"),
+        ("cfn_logical_only", "cloudformation-logical-id", "tag-based"),
+    ]
 
-    # 3. CloudFormation tag match.
-    source_cfn_key = cfn_match_key(source_sg)
-    if source_cfn_key:
-        target, ambiguous, reason = get_single_match(indexes["by_cfn"].get(source_cfn_key, []))
+    for key_type, method, confidence in strict_strategy_order:
+        for value in source_vals.get(key_type, []):
+            target, ambiguous, reason = get_single_match(indexes[key_type].get(value, []))
+            if target:
+                return _make_match(source_sg, target, normalized_key, method, confidence, key_type, value)
+            if ambiguous:
+                return _make_match(source_sg, None, normalized_key, method, "ambiguous", key_type, value, True, reason)
+
+    # Cross-match GroupName <-> Name tag using normalized keys.
+    normalized_candidates_to_try = []
+    normalized_candidates_to_try.extend(source_vals.get("group_name_normalized", []))
+    normalized_candidates_to_try.extend(source_vals.get("name_tag_normalized", []))
+    normalized_candidates_to_try = sorted(set(v for v in normalized_candidates_to_try if v))
+
+    for value in normalized_candidates_to_try:
+        target, ambiguous, reason = get_single_match(indexes["any_normalized"].get(value, []))
         if target:
-            return MatchInfo(
-                source_name,
-                source_id,
-                normalized_key,
-                target.get("GroupName"),
-                target.get("GroupId"),
-                "cloudformation-tags",
-                "tag-based",
-            )
+            confidence = "low" if is_low_confidence_key(value) else "normalized"
+            return _make_match(source_sg, target, normalized_key, "normalized-any-name", confidence, "any_normalized", value)
         if ambiguous:
-            return MatchInfo(
-                source_name,
-                source_id,
-                normalized_key,
-                match_method="cloudformation-tags",
-                match_confidence="ambiguous",
-                ambiguous=True,
-                ambiguity_reason=reason,
-            )
+            return _make_match(source_sg, None, normalized_key, "normalized-any-name", "ambiguous", "any_normalized", value, True, reason)
 
-    # 4. Multi-key normalized name match.
-    #
-    # This is the important patch:
-    # The old version indexed one normalized key only. In CloudFormation-heavy accounts,
-    # the source and target may normalize differently because stack prefixes, env tokens,
-    # and generated suffixes differ. Here we try every safe deterministic source key
-    # against every indexed target key, then de-duplicate by target GroupId.
-    matched_by_gid: Dict[str, Tuple[Dict[str, Any], str]] = {}
+    # Last fallback: compact key cross-match. This is intentionally lower confidence.
+    compact_candidates_to_try = []
+    compact_candidates_to_try.extend(source_vals.get("group_name_compact", []))
+    compact_candidates_to_try.extend(source_vals.get("name_tag_compact", []))
+    compact_candidates_to_try = sorted(set(v for v in compact_candidates_to_try if v))
 
-    for key in source_keys:
-        for candidate in indexes["by_normalized"].get(key, []):
-            gid = candidate.get("GroupId")
-            if gid:
-                matched_by_gid[gid] = (candidate, key)
+    for value in compact_candidates_to_try:
+        target, ambiguous, reason = get_single_match(indexes["any_compact"].get(value, []))
+        if target:
+            confidence = "low" if is_low_confidence_key(value) else "compact-normalized"
+            return _make_match(source_sg, target, normalized_key, "compact-any-name", confidence, "any_compact", value)
+        if ambiguous:
+            return _make_match(source_sg, None, normalized_key, "compact-any-name", "ambiguous", "any_compact", value, True, reason)
 
-    if len(matched_by_gid) == 1:
-        target, matched_key = next(iter(matched_by_gid.values()))
-        confidence = "low" if is_low_confidence_key(matched_key) else "normalized"
-        return MatchInfo(
-            source_name,
-            source_id,
-            matched_key,
-            target.get("GroupName"),
-            target.get("GroupId"),
-            "normalized-name",
-            confidence,
-        )
+    # Useful diagnostic: if source GroupName and NameTag differ, normalized key should show the stronger human label.
+    if source_name_tag and normalize_sg_name(source_name_tag, src_acct, tgt_acct):
+        normalized_key = f"group={normalize_sg_name(source_name, src_acct, tgt_acct)} | name-tag={normalize_sg_name(source_name_tag, src_acct, tgt_acct)}"
 
-    if len(matched_by_gid) > 1:
-        names = [
-            f"{sg.get('GroupName')} ({sg.get('GroupId')}) via key '{key}'"
-            for sg, key in matched_by_gid.values()
-        ]
-        return MatchInfo(
-            source_name,
-            source_id,
-            normalized_key,
-            match_method="normalized-name",
-            match_confidence="ambiguous",
-            ambiguous=True,
-            ambiguity_reason="Multiple target SGs matched normalized fallback keys: " + ", ".join(sorted(names)),
-        )
-
-    return MatchInfo(source_name, source_id, normalized_key)
+    return _make_match(source_sg, None, normalized_key, "unmatched", "unmatched")
 
 
 def build_match_map(source_groups, target_sgs, name_map, src_acct, tgt_acct):
@@ -713,7 +653,9 @@ def build_match_map(source_groups, target_sgs, name_map, src_acct, tgt_acct):
         if match.ambiguous:
             unsafe_reasons.append(f"Ambiguous match for source SG '{match.source_group_name}': {match.ambiguity_reason}")
         if match.match_confidence == "low":
-            unsafe_reasons.append(f"Low-confidence normalized match for source SG '{match.source_group_name}' using key '{match.normalized_match_key}' -> target '{match.target_group_name}'")
+            unsafe_reasons.append(
+                f"Low-confidence normalized match for source SG '{match.source_group_name}' using key '{match.matched_key_value or match.normalized_match_key}' -> target '{match.target_group_name}'"
+            )
     return match_by_source_name, unsafe_reasons, target_by_group_id
 
 
@@ -799,8 +741,10 @@ def permission_key(p):
 def diff_permissions(source_perms, target_perms):
     source_by_key = {permission_key(p): p for p in source_perms}
     target_by_key = {permission_key(p): p for p in target_perms}
-    return ([source_by_key[k] for k in sorted(source_by_key.keys() - target_by_key.keys())],
-            [target_by_key[k] for k in sorted(target_by_key.keys() - source_by_key.keys())])
+    return (
+        [source_by_key[k] for k in sorted(source_by_key.keys() - target_by_key.keys())],
+        [target_by_key[k] for k in sorted(target_by_key.keys() - source_by_key.keys())],
+    )
 
 
 def find_many_to_one_source_target_mappings(results):
@@ -829,11 +773,15 @@ def build_plan(source_groups, target_sgs, name_map, src_acct, tgt_acct) -> Plan:
             source_group_name=match.source_group_name,
             normalized_match_key=match.normalized_match_key,
             source_group_id=match.source_group_id,
+            source_name_tag=match.source_name_tag,
             target_group_name=match.target_group_name,
             target_group_id=match.target_group_id,
+            target_name_tag=match.target_name_tag,
             exists_in_target=bool(target_sg),
             match_method=match.match_method,
             match_confidence=match.match_confidence,
+            matched_key_type=match.matched_key_type,
+            matched_key_value=match.matched_key_value,
             ambiguous=match.ambiguous,
             ambiguity_reason=match.ambiguity_reason,
         )
@@ -846,6 +794,7 @@ def build_plan(source_groups, target_sgs, name_map, src_acct, tgt_acct) -> Plan:
             result.missing.append("SG missing in target")
             results.append(result)
             continue
+
         notes = []
         src_ing = canonicalize_permissions(sg.get("IpPermissions", []), source_id_to_match, source_name_to_match, notes)
         src_eg = canonicalize_permissions(sg.get("IpPermissionsEgress", []), source_id_to_match, source_name_to_match, notes)
@@ -889,29 +838,72 @@ def compute_summary(results):
         "missing": len(missing),
         "ambiguous": len(ambiguous),
         "low_confidence_matches": len(low_conf),
-        "missing_list": [r.source_group_name for r in missing],
-        "ambiguous_list": [{"source_group_name": r.source_group_name, "normalized_match_key": r.normalized_match_key, "reason": r.ambiguity_reason} for r in ambiguous],
-        "low_confidence_list": [{"source_group_name": r.source_group_name, "target_group_name": r.target_group_name, "normalized_match_key": r.normalized_match_key, "match_method": r.match_method} for r in low_conf],
-        "drift_list": [{
-            "source_group_name": r.source_group_name,
-            "target_group_name": r.target_group_name,
-            "target_group_id": r.target_group_id,
-            "normalized_match_key": r.normalized_match_key,
-            "match_method": r.match_method,
-            "match_confidence": r.match_confidence,
-            "fields": r.drift_fields,
-            "missing_ingress_rules": len(r.missing_ingress_rules),
-            "extra_ingress_rules": len(r.extra_ingress_rules),
-            "missing_egress_rules": len(r.missing_egress_rules),
-            "extra_egress_rules": len(r.extra_egress_rules),
-            "tag_drift": r.tag_drift,
-            "description_drift": r.description_drift,
-        } for r in drift],
+        "missing_list": [
+            {
+                "source_group_name": r.source_group_name,
+                "source_name_tag": r.source_name_tag,
+                "normalized_match_key": r.normalized_match_key,
+                "match_method": r.match_method,
+            }
+            for r in missing
+        ],
+        "ambiguous_list": [
+            {
+                "source_group_name": r.source_group_name,
+                "source_name_tag": r.source_name_tag,
+                "normalized_match_key": r.normalized_match_key,
+                "matched_key_type": r.matched_key_type,
+                "matched_key_value": r.matched_key_value,
+                "reason": r.ambiguity_reason,
+            }
+            for r in ambiguous
+        ],
+        "low_confidence_list": [
+            {
+                "source_group_name": r.source_group_name,
+                "source_name_tag": r.source_name_tag,
+                "target_group_name": r.target_group_name,
+                "target_name_tag": r.target_name_tag,
+                "normalized_match_key": r.normalized_match_key,
+                "matched_key_type": r.matched_key_type,
+                "matched_key_value": r.matched_key_value,
+                "match_method": r.match_method,
+            }
+            for r in low_conf
+        ],
+        "drift_list": [
+            {
+                "source_group_name": r.source_group_name,
+                "source_name_tag": r.source_name_tag,
+                "target_group_name": r.target_group_name,
+                "target_name_tag": r.target_name_tag,
+                "target_group_id": r.target_group_id,
+                "normalized_match_key": r.normalized_match_key,
+                "matched_key_type": r.matched_key_type,
+                "matched_key_value": r.matched_key_value,
+                "match_method": r.match_method,
+                "match_confidence": r.match_confidence,
+                "fields": r.drift_fields,
+                "missing_ingress_rules": len(r.missing_ingress_rules),
+                "extra_ingress_rules": len(r.extra_ingress_rules),
+                "missing_egress_rules": len(r.missing_egress_rules),
+                "extra_egress_rules": len(r.extra_egress_rules),
+                "tag_drift": r.tag_drift,
+                "description_drift": r.description_drift,
+            }
+            for r in drift
+        ],
     }
 
 
 def write_report(report_path: str, plan: Plan, mode: str) -> None:
-    payload = {"mode": mode, "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "summary": compute_summary(plan.changes), "unsafe_reasons": plan.unsafe_reasons, "results": [asdict(r) for r in plan.changes]}
+    payload = {
+        "mode": mode,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": compute_summary(plan.changes),
+        "unsafe_reasons": plan.unsafe_reasons,
+        "results": [asdict(r) for r in plan.changes],
+    }
     Path(report_path).parent.mkdir(parents=True, exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -930,20 +922,36 @@ def print_summary(plan: Plan) -> None:
     log("=============================\n")
     if summary["missing_list"]:
         log("Missing SGs:")
-        for m in summary["missing_list"]:
-            log(f" - {m}")
+        for item in summary["missing_list"]:
+            log(f" - {item['source_group_name']} | NameTag={item.get('source_name_tag') or ''} | key={item['normalized_match_key']}")
     if summary["ambiguous_list"]:
         log("\nAmbiguous Matches:")
         for item in summary["ambiguous_list"]:
-            log(f" - {item['source_group_name']} -> {item['normalized_match_key']} ({item['reason']})")
+            log(
+                f" - {item['source_group_name']} | NameTag={item.get('source_name_tag') or ''} "
+                f"| key={item['normalized_match_key']} | matched={item.get('matched_key_type')}:{item.get('matched_key_value')} "
+                f"({item['reason']})"
+            )
     if summary["low_confidence_list"]:
         log("\nLow Confidence Matches:")
         for item in summary["low_confidence_list"]:
-            log(f" - {item['source_group_name']} -> {item['target_group_name']} (key={item['normalized_match_key']}, method={item['match_method']})")
+            log(
+                f" - {item['source_group_name']} -> {item['target_group_name']} "
+                f"| source NameTag={item.get('source_name_tag') or ''} "
+                f"| target NameTag={item.get('target_name_tag') or ''} "
+                f"| matched={item.get('matched_key_type')}:{item.get('matched_key_value')} "
+                f"| method={item['match_method']}"
+            )
     if summary["drift_list"]:
         log("\nDrifted SGs:")
         for d in summary["drift_list"]:
-            log(f" - {d['source_group_name']} -> {d['target_group_name']} [key={d['normalized_match_key']}, confidence={d['match_confidence']}] ({', '.join(d['fields'])}) [+ing:{d['missing_ingress_rules']} -ing:{d['extra_ingress_rules']} +eg:{d['missing_egress_rules']} -eg:{d['extra_egress_rules']}]")
+            log(
+                f" - {d['source_group_name']} -> {d['target_group_name']} "
+                f"[source NameTag={d.get('source_name_tag') or ''}, target NameTag={d.get('target_name_tag') or ''}, "
+                f"matched={d.get('matched_key_type')}:{d.get('matched_key_value')}, confidence={d['match_confidence']}] "
+                f"({', '.join(d['fields'])}) [+ing:{d['missing_ingress_rules']} -ing:{d['extra_ingress_rules']} "
+                f"+eg:{d['missing_egress_rules']} -eg:{d['extra_egress_rules']}]"
+            )
     if plan.unsafe_reasons:
         log("\nUnsafe Conditions:")
         for reason in plan.unsafe_reasons:
@@ -967,7 +975,9 @@ def enforce_apply_safety(plan: Plan, args: Args) -> None:
         if r.ambiguous and not args.allow_ambiguous:
             blocking_reasons.append(f"Blocked ambiguous source SG '{r.source_group_name}': {r.ambiguity_reason}")
         if r.match_confidence == "low" and not args.allow_low_confidence:
-            blocking_reasons.append(f"Blocked low-confidence match '{r.source_group_name}' -> '{r.target_group_name}' using normalized key '{r.normalized_match_key}'")
+            blocking_reasons.append(
+                f"Blocked low-confidence match '{r.source_group_name}' -> '{r.target_group_name}' using key '{r.matched_key_value or r.normalized_match_key}'"
+            )
         if any(n.startswith("Could not remap SG reference") for n in r.notes):
             blocking_reasons.append(f"Blocked '{r.source_group_name}' because one or more SG references could not be remapped.")
     blocking_reasons = sorted(set(blocking_reasons))
@@ -1096,10 +1106,60 @@ def apply_plan(ec2, source_groups, target_vpc_id, name_map, src_acct, tgt_acct, 
     log("\n[APPLY] Remediation pass completed.")
 
 
+def debug_name_matching_dump(source_groups, target_sgs, src_acct, tgt_acct, limit=100):
+    log("\n========== NAME MATCH DEBUG DUMP ==========")
+
+    log("\n--- SOURCE SECURITY GROUPS ---")
+    shown = 0
+    for sg in source_groups:
+        if is_default_sg(sg):
+            continue
+        if shown >= limit:
+            log(f"... source debug truncated at {limit} entries")
+            break
+        group_name = sg.get("GroupName", "")
+        name_tag_value = name_tag(sg) or ""
+        log(
+            f"SOURCE | GroupName='{group_name}' "
+            f"| GroupId='{sg.get('GroupId')}' "
+            f"| NameTag='{name_tag_value}' "
+            f"| NormGroup='{normalize_sg_name(group_name, src_acct, tgt_acct)}' "
+            f"| NormNameTag='{normalize_sg_name(name_tag_value, src_acct, tgt_acct)}' "
+            f"| CompactGroup='{compact_name_key(group_name, src_acct, tgt_acct)}' "
+            f"| CompactNameTag='{compact_name_key(name_tag_value, src_acct, tgt_acct)}' "
+            f"| CFNStackLogical='{cfn_match_key(sg)}' "
+            f"| CFNLogical='{cfn_logical_key(sg)}'"
+        )
+        shown += 1
+
+    log("\n--- TARGET SECURITY GROUPS ---")
+    shown = 0
+    for sg in target_sgs:
+        if is_default_sg(sg):
+            continue
+        if shown >= limit:
+            log(f"... target debug truncated at {limit} entries")
+            break
+        group_name = sg.get("GroupName", "")
+        name_tag_value = name_tag(sg) or ""
+        log(
+            f"TARGET | GroupName='{group_name}' "
+            f"| GroupId='{sg.get('GroupId')}' "
+            f"| NameTag='{name_tag_value}' "
+            f"| NormGroup='{normalize_sg_name(group_name, src_acct, tgt_acct)}' "
+            f"| NormNameTag='{normalize_sg_name(name_tag_value, src_acct, tgt_acct)}' "
+            f"| CompactGroup='{compact_name_key(group_name, src_acct, tgt_acct)}' "
+            f"| CompactNameTag='{compact_name_key(name_tag_value, src_acct, tgt_acct)}' "
+            f"| CFNStackLogical='{cfn_match_key(sg)}' "
+            f"| CFNLogical='{cfn_logical_key(sg)}'"
+        )
+        shown += 1
+
+    log("===========================================\n")
+
+
 def print_name_preview(source_groups, target_sgs, name_map, src_acct, tgt_acct):
-    match_by_source_name, unsafe_reasons, _ = build_match_map(
-        source_groups, target_sgs, name_map, src_acct, tgt_acct
-    )
+    match_by_source_name, unsafe_reasons, _ = build_match_map(source_groups, target_sgs, name_map, src_acct, tgt_acct)
 
     log("\n========== NAME PREVIEW ==========")
 
@@ -1111,9 +1171,12 @@ def print_name_preview(source_groups, target_sgs, name_map, src_acct, tgt_acct):
 
         log(
             f"Source: {match.source_group_name} "
+            f"| Source NameTag: {match.source_name_tag or ''} "
             f"| Target: {match.target_group_name or 'NOT FOUND'} "
+            f"| Target NameTag: {match.target_name_tag or ''} "
             f"| Target ID: {match.target_group_id or 'N/A'} "
             f"| Key: {match.normalized_match_key} "
+            f"| Matched: {(match.matched_key_type or 'N/A')}={(match.matched_key_value or 'N/A')} "
             f"| Method: {match.match_method} "
             f"| Confidence: {match.match_confidence}"
         )
@@ -1122,19 +1185,22 @@ def print_name_preview(source_groups, target_sgs, name_map, src_acct, tgt_acct):
             log(f"  Ambiguous: {match.ambiguity_reason}")
 
         if not match.target_group_id:
-            source_keys = set(normalized_sg_keys(match.source_group_name, src_acct, tgt_acct))
-            possible_same_key = [
-                candidate_sg.get("GroupName", "")
-                for candidate_sg in target_sgs
-                if source_keys.intersection(
-                    set(normalized_sg_keys(candidate_sg.get("GroupName", ""), src_acct, tgt_acct))
-                )
-            ]
+            possible_same_key = []
+            source_values = identity_values_for_sg(sg, src_acct, tgt_acct)
+            source_norms = set(source_values.get("group_name_normalized", []) + source_values.get("name_tag_normalized", []))
+            source_compacts = set(source_values.get("group_name_compact", []) + source_values.get("name_tag_compact", []))
+
+            for candidate_sg in target_sgs:
+                candidate_values = identity_values_for_sg(candidate_sg, src_acct, tgt_acct)
+                candidate_norms = set(candidate_values.get("group_name_normalized", []) + candidate_values.get("name_tag_normalized", []))
+                candidate_compacts = set(candidate_values.get("group_name_compact", []) + candidate_values.get("name_tag_compact", []))
+                if source_norms.intersection(candidate_norms) or source_compacts.intersection(candidate_compacts):
+                    possible_same_key.append(candidate_sg)
 
             if possible_same_key:
-                log("  Possible target candidates with same normalized key:")
+                log("  Possible target candidates with same normalized/compact key:")
                 for candidate in possible_same_key:
-                    log(f"   - {candidate}")
+                    log(f"   - GroupName={candidate.get('GroupName')} | NameTag={name_tag(candidate) or ''} | GroupId={candidate.get('GroupId')}")
 
     if unsafe_reasons:
         log("\nUnsafe Conditions:")
@@ -1147,10 +1213,7 @@ def print_name_preview(source_groups, target_sgs, name_map, src_acct, tgt_acct):
 def main() -> int:
     args = parse_args()
 
-    source_groups = [
-        s for s in load_json_security_groups(args.json_path)
-        if not is_default_sg(s)
-    ]
+    source_groups = [s for s in load_json_security_groups(args.json_path) if not is_default_sg(s)]
 
     if not source_groups:
         log("No non-default security groups found.")
@@ -1159,18 +1222,12 @@ def main() -> int:
     name_map = load_name_map(args.name_map_path)
 
     ec2 = get_ec2(args.target_profile, args.target_region)
-    tgt_acct = get_account_id(args.target_profile, args.target_region)
+    tgt_acct = args.target_account_id or get_account_id(args.target_profile, args.target_region)
 
-    src_acct = args.source_account_id or next(
-        (s.get("OwnerId") for s in source_groups if s.get("OwnerId")),
-        "",
-    )
+    src_acct = args.source_account_id or next((s.get("OwnerId") for s in source_groups if s.get("OwnerId")), "")
 
     if not src_acct:
-        log(
-            "[WARN] No source account ID provided and none found in JSON. "
-            "Account-ID normalization will be skipped."
-        )
+        log("[WARN] No source account ID provided and none found in JSON. Account-ID normalization will be skipped.")
 
     log(f"[INFO] Source SGs: {len(source_groups)}")
     log(f"[INFO] Source account from export/CLI: {src_acct or 'UNKNOWN'}")
@@ -1184,62 +1241,31 @@ def main() -> int:
     target_sgs = get_target_sgs(ec2, args.target_vpc_id)
     log(f"[INFO] Target SGs discovered in VPC: {len(target_sgs)}")
 
+    if args.debug_names:
+        debug_name_matching_dump(source_groups, target_sgs, src_acct, tgt_acct)
+
     if args.name_preview:
-        print_name_preview(
-            source_groups,
-            target_sgs,
-            name_map,
-            src_acct,
-            tgt_acct,
-        )
+        print_name_preview(source_groups, target_sgs, name_map, src_acct, tgt_acct)
         return 0
 
-    initial_plan = build_plan(
-        source_groups,
-        target_sgs,
-        name_map,
-        src_acct,
-        tgt_acct,
-    )
+    initial_plan = build_plan(source_groups, target_sgs, name_map, src_acct, tgt_acct)
 
     log("\n[INITIAL AUDIT]")
     print_summary(initial_plan)
 
     if args.dry_run or args.report_only:
-        write_report(
-            args.report_path,
-            initial_plan,
-            mode="dry-run" if args.dry_run else "report-only",
-        )
+        write_report(args.report_path, initial_plan, mode="dry-run" if args.dry_run else "report-only")
         return compute_exit_code(initial_plan)
 
     if args.yes:
-        apply_plan(
-            ec2,
-            source_groups,
-            args.target_vpc_id,
-            name_map,
-            src_acct,
-            tgt_acct,
-            args,
-        )
+        apply_plan(ec2, source_groups, args.target_vpc_id, name_map, src_acct, tgt_acct, args)
 
-        final_plan = build_plan(
-            source_groups,
-            get_target_sgs(ec2, args.target_vpc_id),
-            name_map,
-            src_acct,
-            tgt_acct,
-        )
+        final_plan = build_plan(source_groups, get_target_sgs(ec2, args.target_vpc_id), name_map, src_acct, tgt_acct)
 
         log("\n[FINAL AUDIT AFTER REMEDIATION]")
         print_summary(final_plan)
 
-        write_report(
-            args.report_path,
-            final_plan,
-            mode="yes-applied",
-        )
+        write_report(args.report_path, final_plan, mode="yes-applied")
 
         return compute_exit_code(final_plan)
 
