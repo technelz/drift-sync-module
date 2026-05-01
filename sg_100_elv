@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+import sys
+import json
+import argparse
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+from dataclasses import dataclass, asdict
+import re
+
+
+# --------------------------------------------------------------------
+# LOGGING
+# --------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stdout)
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+# --------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Sync security groups from JSON export to target VPC."
+    )
+
+    # Source (JSON)
+    p.add_argument(
+        "--json-path",
+        required=True,
+        help="Path to source SG JSON (describe-security-groups output).",
+    )
+
+    # Target (AWS)
+    p.add_argument(
+        "--target-vpc-id",
+        required=True,
+        help="Target VPC ID (where SGs will be reconciled/created).",
+    )
+    p.add_argument(
+        "--target-profile",
+        default=None,
+        help="AWS profile name for target account.",
+    )
+    p.add_argument(
+        "--target-region",
+        default=None,
+        help="AWS region for target account (optional, falls back to profile/default).",
+    )
+
+    # Modes
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only audit, do not apply changes.",
+    )
+    p.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Write report and exit, no apply.",
+    )
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply remediation to target VPC.",
+    )
+
+    # Safety / behavior
+    p.add_argument(
+        "--allow-legacy",
+        action="store_true",
+        help="Allow remediation of SGs matched via legacy canonical fallback.",
+    )
+    p.add_argument(
+        "--revoke-extra-rules",
+        action="store_true",
+        help="Revoke extra rules in target that are not in source.",
+    )
+
+    # Report
+    from datetime import datetime
+    ts_file = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+
+    p.add_argument(
+        "--report-path",
+        default=f"sg_reports/sg_sync_report_{ts_file}.json",
+        help="Path to write JSON report.",
+    )
+
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------
+# SOURCE: JSON LOADER
+# --------------------------------------------------------------------
+
+def load_source_sgs_from_json(path: str) -> List[Dict[str, Any]]:
+    """
+    Load source SGs from JSON.
+
+    Supports:
+    - Flat list: [ { SG }, { SG }, ... ]
+    - Wrapped:   { "SecurityGroups": [ { SG }, ... ] }
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "SecurityGroups" in data:
+        return data["SecurityGroups"]
+
+    raise ValueError("Unsupported JSON structure for source SGs.")
+
+
+# --------------------------------------------------------------------
+# TARGET: AWS CLIENT + SG LOADER
+# --------------------------------------------------------------------
+
+def get_ec2_client(profile: Optional[str], region: Optional[str]):
+    """
+    Create an EC2 client for the target account/region.
+    If region is None, boto3 will use the profile/default region.
+    """
+    if profile:
+        session = boto3.Session(profile_name=profile, region_name=region)
+    else:
+        session = boto3.Session(region_name=region)
+    return session.client("ec2")
+
+
+def get_sgs_for_vpc(ec2, vpc_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetch all security groups for a given VPC in the target account.
+    """
+    resp = ec2.describe_security_groups(
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+    )
+    return resp.get("SecurityGroups", [])
+
+
+# --------------------------------------------------------------------
+# PART 2 — CANONICALIZATION + NAME DERIVATION
+# --------------------------------------------------------------------
+
+def normalize_sg_name(name: str) -> str:
+    """
+    Produces a stable canonical name for SG matching.
+    Handles:
+    - Directory Service SGs (d-xxxxxx)
+    - CloudFormation SGs
+    - Bastion SGs with random suffixes
+    - Normal SGs
+    """
+
+    # 1. Directory SGs: canonicalize to directory-id + suffix
+    m = re.search(r"(d-[A-Za-z0-9]+)(_.*)?", name)
+    if m:
+        directory_id = m.group(1)
+        suffix = m.group(2) or ""
+        return (directory_id + suffix).lower()
+
+    # 2. CloudFormation SGs:
+    # stack-<random>-<LogicalName>-<random>
+    if name.startswith("stack-"):
+        parts = name.split("-")
+        if len(parts) >= 4:
+            logical_name = parts[-2]  # second to last token
+            return re.sub(r"[^A-Za-z0-9]", "", logical_name).lower()
+
+    # 3. Bastion SGs or other SGs with random suffixes:
+    tokens = name.split("-")
+    if len(tokens) > 1:
+        last = tokens[-1]
+        if re.match(r"^[A-Za-z0-9]{6,}$", last):
+            tokens = tokens[:-1]
+
+    # 4. Default cleanup
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", "".join(tokens))
+    return cleaned.lower()
+
+
+def derive_new_sg_name(source_name: str) -> str:
+    """
+    Name to use when CREATING a new SG in target.
+
+    - CFN-style: stack-<random>-<LogicalName>-<random> -> <LogicalName>
+    - Non-CFN with trailing random suffix: strip last token
+    - Otherwise: keep original name
+    """
+    raw = source_name.strip()
+    parts = [p for p in raw.replace("_", "-").split("-") if p]
+
+    # CFN-style: extract logical name
+    if len(parts) >= 4 and parts[0].lower() == "stack":
+        alpha_parts = [p for p in parts if any(c.isalpha() for c in p)]
+        if alpha_parts:
+            return max(alpha_parts, key=len)
+
+    # Non-CFN with trailing random suffix
+    if len(parts) >= 2:
+        last = parts[-1]
+        if any(c.isdigit() for c in last) and any(c.isalpha() for c in last):
+            return "-".join(parts[:-1])
+
+    # Default: keep original
+    return raw
+
+
+def extract_directory_suffix(name: str) -> Optional[str]:
+    """
+    For Directory Service SGs, extract the suffix after the directory ID.
+    Example:
+      d-90xxx40365_controllers -> _controllers
+    Returns None if not a Directory SG.
+    """
+    m = re.search(r"d-[A-Za-z0-9]+(_.*)", name)
+    return m.group(1) if m else None
+
+
+# --------------------------------------------------------------------
+# PART 3 — MATCHING ENGINE (STRICT + LEGACY CANONICAL)
+# --------------------------------------------------------------------
+
+@dataclass
+class SgMatch:
+    source_name: str
+    source_id: str
+    target_id: Optional[str]
+    canonical_name: str
+    match_confidence: str      # "strict" or "legacy"
+    matched_via: str           # "strict", "canonical_fallback", "directory-suffix", "none"
+    strict_reason: str
+    legacy_reason: Optional[str] = None
+
+
+def build_target_index(target_groups: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Index target SGs by:
+    - exact name (case-sensitive)
+    - canonical name (case-insensitive)
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+
+    for sg in target_groups:
+        name = sg["GroupName"]
+        canon = normalize_sg_name(name)
+
+        index[f"exact::{name}"] = sg
+        index[f"canon::{canon}"] = sg
+
+    return index
+
+
+def match_sg_strict(
+    source_sg: Dict[str, Any],
+    target_index: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+
+    name = source_sg["GroupName"]
+    key = f"exact::{name}"
+    tgt = target_index.get(key)
+
+    if tgt:
+        return tgt, "matched by exact GroupName"
+
+    return None, "no strict match (exact GroupName not found)"
+
+
+def match_sg_legacy(
+    source_sg: Dict[str, Any],
+    target_index: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+
+    name = source_sg["GroupName"]
+    canon = normalize_sg_name(name)
+    key = f"canon::{canon}"
+
+    tgt = target_index.get(key)
+    if tgt:
+        return tgt, f"matched by canonical name '{canon}'"
+
+    return None, f"no legacy match for canonical '{canon}'"
+
+
+def match_security_groups(
+    source_groups: List[Dict[str, Any]],
+    target_groups: List[Dict[str, Any]],
+) -> List[SgMatch]:
+
+    target_index = build_target_index(target_groups)
+    matches: List[SgMatch] = []
+
+    for sg in source_groups:
+        src_name = sg["GroupName"]
+        src_id = sg.get("GroupId", "")
+        canon = normalize_sg_name(src_name)
+
+        # -----------------------------------------
+        # 0. Directory-aware matching (by suffix, not ID)
+        # -----------------------------------------
+        src_suffix = extract_directory_suffix(src_name)
+        if src_suffix:
+            for tgt in target_groups:
+                tgt_suffix = extract_directory_suffix(tgt["GroupName"])
+                if tgt_suffix == src_suffix:
+                    matches.append(
+                        SgMatch(
+                            source_name=src_name,
+                            source_id=src_id,
+                            target_id=tgt["GroupId"],
+                            canonical_name=canon,
+                            match_confidence="strict",
+                            matched_via="directory-suffix",
+                            strict_reason=f"matched by Directory SG suffix '{src_suffix}'",
+                        )
+                    )
+                    break
+
+            # If we matched via directory suffix, skip strict/canonical
+            if matches and matches[-1].source_name == src_name:
+                continue
+
+        # -------------------
+        # 1. Strict name match
+        # -------------------
+        strict_tgt, strict_reason = match_sg_strict(sg, target_index)
+        if strict_tgt:
+            matches.append(
+                SgMatch(
+                    source_name=src_name,
+                    source_id=src_id,
+                    target_id=strict_tgt["GroupId"],
+                    canonical_name=canon,
+                    match_confidence="strict",
+                    matched_via="strict",
+                    strict_reason=strict_reason,
+                )
+            )
+            continue
+
+        # -----------------------------
+        # 2. Canonical (legacy) fallback
+        # -----------------------------
+        legacy_tgt, legacy_reason = match_sg_legacy(sg, target_index)
+        if legacy_tgt:
+            matches.append(
+                SgMatch(
+                    source_name=src_name,
+                    source_id=src_id,
+                    target_id=legacy_tgt["GroupId"],
+                    canonical_name=canon,
+                    match_confidence="legacy",
+                    matched_via="canonical_fallback",
+                    strict_reason=strict_reason,
+                    legacy_reason=legacy_reason,
+                )
+            )
+            continue
+
+        # ---------------
+        # 3. No match found
+        # ---------------
+        matches.append(
+            SgMatch(
+                source_name=src_name,
+                source_id=src_id,
+                target_id=None,
+                canonical_name=canon,
+                match_confidence="strict",
+                matched_via="none",
+                strict_reason=strict_reason,
+            )
+        )
+
+    return matches
+
+
+# --------------------------------------------------------------------
+# PART 4 — DRIFT DETECTION + PLAN BUILDER
+# --------------------------------------------------------------------
+
+@dataclass
+class SgDrift:
+    group_name: str
+    source_group_id: str
+    target_group_id: str
+    missing_ingress: List[Dict[str, Any]]
+    extra_ingress: List[Dict[str, Any]]
+    missing_egress: List[Dict[str, Any]]
+    extra_egress: List[Dict[str, Any]]
+    tag_drift: bool
+    tag_diff_count: int
+    description_drift: bool
+    match: SgMatch
+
+
+@dataclass
+class SgPlan:
+    matches: List[SgMatch]
+    drifts: List[SgDrift]
+    missing: List[SgMatch]
+
+
+def _rules_key(rule: Dict[str, Any]) -> str:
+    """
+    Convert a rule dict into a stable JSON string for comparison.
+    """
+    return json.dumps(rule, sort_keys=True)
+
+
+def diff_rules(
+    src_rules: List[Dict[str, Any]],
+    tgt_rules: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns:
+      missing = rules in source but not in target
+      extra   = rules in target but not in source
+    """
+    src_map = {_rules_key(r): r for r in src_rules}
+    tgt_map = {_rules_key(r): r for r in tgt_rules}
+
+    missing = [src_map[k] for k in src_map.keys() - tgt_map.keys()]
+    extra = [tgt_map[k] for k in tgt_map.keys() - src_map.keys()]
+
+    return missing, extra
+
+
+def diff_tags(
+    src_tags: List[Dict[str, str]],
+    tgt_tags: List[Dict[str, str]],
+) -> Tuple[bool, int]:
+    """
+    Returns:
+      tag_drift: True/False
+      diff_count: number of differing tag keys
+    """
+    src_map = {t["Key"]: t["Value"] for t in (src_tags or [])}
+    tgt_map = {t["Key"]: t["Value"] for t in (tgt_tags or [])}
+
+    diff_keys = {
+        k for k in src_map.keys() | tgt_map.keys()
+        if src_map.get(k) != tgt_map.get(k)
+    }
+
+    return bool(diff_keys), len(diff_keys)
+
+
+def build_plan(
+    source_groups: List[Dict[str, Any]],
+    target_groups: List[Dict[str, Any]],
+) -> SgPlan:
+
+    matches = match_security_groups(source_groups, target_groups)
+    target_by_id = {sg["GroupId"]: sg for sg in target_groups}
+
+    drifts: List[SgDrift] = []
+    missing: List[SgMatch] = []
+
+    for m in matches:
+        # No match → missing SG
+        if m.target_id is None:
+            missing.append(m)
+            continue
+
+        # Find source + target SG objects
+        src = next(s for s in source_groups if s.get("GroupId") == m.source_id)
+        tgt = target_by_id[m.target_id]
+
+        # Rules
+        src_ing = src.get("IpPermissions", [])
+        tgt_ing = tgt.get("IpPermissions", [])
+        src_egr = src.get("IpPermissionsEgress", [])
+        tgt_egr = tgt.get("IpPermissionsEgress", [])
+
+        miss_ing, extra_ing = diff_rules(src_ing, tgt_ing)
+        miss_egr, extra_egr = diff_rules(src_egr, tgt_egr)
+
+        # Tags
+        src_tags = src.get("Tags", []) or []
+        tgt_tags = tgt.get("Tags", []) or []
+        tag_drift, tag_diff_count = diff_tags(src_tags, tgt_tags)
+
+        # Description
+        desc_drift = (src.get("Description") or "") != (tgt.get("Description") or "")
+
+        # If anything differs → drift object
+        if any([miss_ing, extra_ing, miss_egr, extra_egr, tag_drift, desc_drift]):
+            drifts.append(
+                SgDrift(
+                    group_name=m.source_name,
+                    source_group_id=m.source_id,
+                    target_group_id=m.target_id,
+                    missing_ingress=miss_ing,
+                    extra_ingress=extra_ing,
+                    missing_egress=miss_egr,
+                    extra_egress=extra_egr,
+                    tag_drift=tag_drift,
+                    tag_diff_count=tag_diff_count,
+                    description_drift=desc_drift,
+                    match=m,
+                )
+            )
+
+    return SgPlan(matches=matches, drifts=drifts, missing=missing)
+
+
+# --------------------------------------------------------------------
+# PART 5 — APPLY LOGIC + SUMMARY + REPORT + MAIN()
+# --------------------------------------------------------------------
+
+def create_missing_sg(
+    ec2,
+    target_vpc_id: str,
+    source_sg: Dict[str, Any],
+) -> str:
+    """
+    Create a new SG in the target VPC based on the source SG.
+    Uses derived naming (strip suffix / logical name).
+    """
+    src_name = source_sg["GroupName"]
+    new_name = derive_new_sg_name(src_name)
+    desc = source_sg.get("Description") or f"Cloned from {src_name}"
+
+    log(f"[CREATE-SG] Creating SG '{new_name}' in VPC {target_vpc_id}")
+
+    resp = ec2.create_security_group(
+        GroupName=new_name,
+        Description=desc,
+        VpcId=target_vpc_id,
+    )
+    new_id = resp["GroupId"]
+
+    # Tags
+    tags = source_sg.get("Tags") or []
+    if tags:
+        ec2.create_tags(Resources=[new_id], Tags=tags)
+        log(f"[TAGS] Applied {len(tags)} tags to {new_id}")
+
+    # Rules
+    ing = source_sg.get("IpPermissions") or []
+    egr = source_sg.get("IpPermissionsEgress") or []
+
+    if ing:
+        ec2.authorize_security_group_ingress(GroupId=new_id, IpPermissions=ing)
+        log(f"[RULES] Added {len(ing)} ingress rules to {new_id}")
+
+    if egr:
+        ec2.authorize_security_group_egress(GroupId=new_id, IpPermissions=egr)
+        log(f"[RULES] Added {len(egr)} egress rules to {new_id}")
+
+    return new_id
+
+
+def apply_plan(
+    ec2,
+    plan: SgPlan,
+    source_groups: List[Dict[str, Any]],
+    target_vpc_id: str,
+    allow_legacy: bool,
+    revoke_extra_rules_enabled: bool,
+):
+    # Safety block for legacy matches
+    legacy_matches = [
+        m for m in plan.matches
+        if m.target_id and m.match_confidence == "legacy"
+    ]
+
+    if legacy_matches and not allow_legacy:
+        log("\n[SAFETY BLOCK] Legacy matches detected. Remediation halted.")
+        for m in legacy_matches:
+            log(f" - {m.source_name} → {m.target_id} (canonical: {m.canonical_name})")
+        log("Re-run with --allow-legacy to proceed.")
+        return
+
+    # 1. Create missing SGs
+    if plan.missing:
+        log("\n[APPLY] Creating missing SGs...")
+        for m in plan.missing:
+            src = next(s for s in source_groups if s.get("GroupId") == m.source_id)
+            new_id = create_missing_sg(ec2, target_vpc_id, src)
+            log(f"[CREATE-SG] Created {new_id} for source {m.source_name}")
+
+    # 2. Apply drift
+    if plan.drifts:
+        log("\n[APPLY] Reconciling drift...")
+        for d in plan.drifts:
+            tgt_id = d.target_group_id
+
+            # Add missing ingress
+            if d.missing_ingress:
+                ec2.authorize_security_group_ingress(
+                    GroupId=tgt_id,
+                    IpPermissions=d.missing_ingress,
+                )
+                log(f"[ADD-INGRESS] {tgt_id} +{len(d.missing_ingress)}")
+
+            # Add missing egress
+            if d.missing_egress:
+                ec2.authorize_security_group_egress(
+                    GroupId=tgt_id,
+                    IpPermissions=d.missing_egress,
+                )
+                log(f"[ADD-EGRESS] {tgt_id} +{len(d.missing_egress)}")
+
+            # Remove extra rules if enabled
+            if revoke_extra_rules_enabled:
+                if d.extra_ingress:
+                    ec2.revoke_security_group_ingress(
+                        GroupId=tgt_id,
+                        IpPermissions=d.extra_ingress,
+                    )
+                    log(f"[REMOVE-INGRESS] {tgt_id} -{len(d.extra_ingress)}")
+
+                if d.extra_egress:
+                    ec2.revoke_security_group_egress(
+                        GroupId=tgt_id,
+                        IpPermissions=d.extra_egress,
+                    )
+                    log(f"[REMOVE-EGRESS] {tgt_id} -{len(d.extra_egress)}")
+
+
+def print_summary(plan: SgPlan):
+    total = len(plan.matches)
+    strict = len([m for m in plan.matches if m.target_id and m.match_confidence == "strict"])
+    legacy = len([m for m in plan.matches if m.target_id and m.match_confidence == "legacy"])
+    missing = len(plan.missing)
+    drift = len(plan.drifts)
+
+    log("\n========== SUMMARY ==========")
+    log(f"Total source SGs: {total}")
+    log(f"Strict matches:   {strict}")
+    log(f"Legacy matches:   {legacy}")
+    log(f"Missing in target:{missing}")
+    log(f"Drifted SGs:      {drift}")
+
+    if plan.missing:
+        log("\nMissing SGs:")
+        for m in plan.missing:
+            log(f" - {m.source_name} (canonical: {m.canonical_name})")
+            log(f"   reason: {m.strict_reason}")
+
+    legacy_matches = [
+        m for m in plan.matches
+        if m.target_id and m.match_confidence == "legacy"
+    ]
+    if legacy_matches:
+        log("\nLegacy matches (require --allow-legacy):")
+        for m in legacy_matches:
+            log(f" - {m.source_name} → {m.target_id}")
+            log(f"   strict: {m.strict_reason}")
+            log(f"   legacy: {m.legacy_reason}")
+
+    if plan.drifts:
+        log("\nDrift details:")
+        for d in plan.drifts:
+            log(f"\nSG: {d.group_name}")
+            log(f"  Source: {d.source_group_id}")
+            log(f"  Target: {d.target_group_id}")
+            log(f"  Match:  {d.match.match_confidence} via {d.match.matched_via}")
+            log("  Drift:")
+            log(f"   - Missing ingress: {len(d.missing_ingress)}")
+            log(f"   - Extra ingress:   {len(d.extra_ingress)}")
+            log(f"   - Missing egress:  {len(d.missing_egress)}")
+            log(f"   - Extra egress:    {len(d.extra_egress)}")
+            log(f"   - Tag drift:       {d.tag_drift} ({d.tag_diff_count} keys)")
+            log(f"   - Description:     {d.description_drift}")
+
+
+def write_report(path: str, plan: SgPlan, mode: str):
+    from datetime import datetime
+    import os
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Timestamp for metadata
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Summary fields
+    total = len(plan.matches)
+    legacy = len([m for m in plan.matches if m.target_id and m.match_confidence == "legacy"])
+    missing = len(plan.missing)
+    drift = len(plan.drifts)
+
+    summary = {
+        "total": total,
+        "in_sync": total - (missing + drift),
+        "drift": drift,
+        "missing": missing,
+        "ambiguous": 0,
+        "low_confidence_matches": legacy,
+    }
+
+    # JSON structure — summary FIRST
+    data = {
+        "summary": summary,
+        "mode": mode,
+        "generated_at": ts,
+        "matches": [asdict(m) for m in plan.matches],
+        "drifts": [asdict(d) for d in plan.drifts],
+        "missing_list": [asdict(m) for m in plan.missing],
+    }
+
+    # Write JSON WITHOUT sort_keys
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    log(f"[INFO] Report written to {path}")
+
+
+def main() -> int:
+    args = parse_args()
+
+    if not (args.dry_run or args.report_only or args.yes):
+        eprint("You must specify one of: --dry-run, --report-only, or --yes.")
+        return 1
+
+    # Load source SGs
+    log(f"[INFO] Loading source SGs from JSON: {args.json_path}")
+    source_groups = load_source_sgs_from_json(args.json_path)
+    log(f"[INFO] Loaded {len(source_groups)} source SGs")
+
+    # Load target SGs
+    log(f"[INFO] Connecting to target AWS (profile={args.target_profile}, region={args.target_region})")
+    tgt_ec2 = get_ec2_client(args.target_profile, args.target_region)
+
+    log(f"[INFO] Fetching target SGs from VPC {args.target_vpc_id}")
+    target_groups = get_sgs_for_vpc(tgt_ec2, args.target_vpc_id)
+    log(f"[INFO] Loaded {len(target_groups)} target SGs")
+
+    # Build plan
+    log("[INFO] Building plan...")
+    plan = build_plan(source_groups, target_groups)
+
+    # Summary + report
+    print_summary(plan)
+    mode = "dry-run" if args.dry_run else ("report-only" if args.report_only else "yes")
+    write_report(args.report_path, plan, mode)
+
+    # Exit early for dry-run or report-only
+    if args.report_only or args.dry_run:
+        return 0
+
+    # Apply
+    log("\n[APPLY] Applying remediation...")
+    apply_plan(
+        ec2=tgt_ec2,
+        plan=plan,
+        source_groups=source_groups,
+        target_vpc_id=args.target_vpc_id,
+        allow_legacy=args.allow_legacy,
+        revoke_extra_rules_enabled=args.revoke_extra_rules,
+    )
+    log("[APPLY] Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        eprint("[ABORTED] Interrupted by user.")
+        sys.exit(130)
+    except Exception as e:
+        eprint(f"[FATAL] {e}")
+        sys.exit(1)
