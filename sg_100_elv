@@ -1,4 +1,114 @@
 #!/usr/bin/env python3
+
+"""
+================================================================================
+Security Group Sync Tool
+================================================================================
+
+This script synchronizes AWS Security Groups from a **source JSON export**
+(typically produced by `aws ec2 describe-security-groups`) into a **target VPC**
+in another AWS account or region.
+
+It performs three major functions:
+
+1. **Matching**
+   - Identifies which source SG corresponds to which target SG.
+   - Uses strict name matching, canonical name matching, and Directory Service
+     suffix matching.
+   - Flags low‑confidence (legacy) matches for safety.
+
+2. **Drift Detection**
+   - Compares ingress rules, egress rules, tags, and descriptions.
+   - Reports missing rules, extra rules, and tag/description drift.
+   - Produces a detailed JSON report summarizing all findings.
+
+3. **Remediation (optional)**
+   - Creates missing SGs in the target VPC.
+   - Adds missing rules.
+   - Optionally removes extra rules (`--revoke-extra-rules`).
+   - Copies tags and descriptions.
+   - Requires explicit confirmation (`--yes`).
+
+--------------------------------------------------------------------------------
+USAGE
+--------------------------------------------------------------------------------
+
+Basic dry-run (recommended first step):
+
+    python3 sg_sync.py \
+        --json-path source_sgs.json \
+        --target-vpc-id vpc-1234567890abcdef0 \
+        --target-region us-west-2 \
+        --dry-run
+
+Generate a report only (no remediation):
+
+    python3 sg_sync.py \
+        --json-path source_sgs.json \
+        --target-vpc-id vpc-1234567890abcdef0 \
+        --target-region us-west-2 \
+        --report-only
+
+Apply changes to the target VPC:
+
+    python3 sg_sync.py \
+        --json-path source_sgs.json \
+        --target-vpc-id vpc-1234567890abcdef0 \
+        --target-region us-west-2 \
+        --yes
+
+--------------------------------------------------------------------------------
+OPTIONAL FLAGS
+--------------------------------------------------------------------------------
+
+--allow-legacy
+    Allows remediation of SGs matched via canonical (non-strict) matching.
+    Without this flag, the script halts if any legacy matches are detected.
+
+--revoke-extra-rules
+    Removes rules in the target SG that do not exist in the source SG.
+
+--report-path <path>
+    Custom path for the JSON report.
+    If you do not specify --report-path, the script automatically generates a timestamped report filename such as:
+
+    sg_sync_report_2026-05-01_17-14-45.json
+
+--------------------------------------------------------------------------------
+REPORT OUTPUT
+--------------------------------------------------------------------------------
+
+The script writes a JSON report containing:
+
+- Summary of total SGs, drifted SGs, missing SGs, and legacy matches.
+- Full match list (strict, legacy, directory-suffix).
+- Drift details for each SG (missing/extra ingress/egress, tag drift, description drift).
+- List of SGs missing in the target VPC.
+
+This report is safe to archive, compare, or feed into CI/CD pipelines.
+
+--------------------------------------------------------------------------------
+RECOMMENDED WORKFLOW
+--------------------------------------------------------------------------------
+
+1. Run with `--dry-run` to inspect drift and confirm matches.
+2. Review the generated report.
+3. If legacy matches appear, decide whether to allow them.
+4. Run with `--yes` to apply changes.
+5. Optionally enable `--revoke-extra-rules` for strict enforcement.
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+
+- The script does not modify or delete existing SGs unless explicitly instructed.
+- Directory Service SGs are matched using suffix-based logic to avoid mismatches.
+- New SGs created in the target VPC inherit rules, tags, and descriptions
+  from the source SG.
+
+================================================================================
+"""
+
 import sys
 import json
 import argparse
